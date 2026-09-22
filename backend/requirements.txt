@@ -1,0 +1,25 @@
+# --- Web framework ---
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic[email]==2.10.4
+pydantic-settings==2.7.0
+
+# --- Realtime chat ---
+websockets==14.1
+
+# --- Auth / security (used by app/core/security.py) ---
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
+python-multipart==0.0.20
+
+# --- Database (PostgreSQL + SQLAlchemy) ---
+sqlalchemy==2.0.36
+asyncpg==0.30.0
+greenlet==3.1.1
+
+# --- Redis (presence) ---
+redis==5.2.1
+
+# --- Config ---
+python-dotenv==1.0.1
