@@ -22,9 +22,16 @@ currently on.
 
 ## Current status
 
-Phase 1 (MVP) backend is done through Step 6 (auth, 1-to-1 WebSocket chat with keyset
-pagination, Redis presence/typing). Step 7 (frontend auth + chat UI) has not been started —
-`frontend/app` still holds the default `create-next-app` scaffold.
+Phase 1 (MVP) is functionally complete through Step 7: backend (auth, 1-to-1 WebSocket chat
+with keyset pagination, Redis presence/typing) plus a working frontend (auth pages, chat list,
+live messaging, typing indicator, presence). GUIDE.md's own Step 7 write-up still needs to be
+authored to match its established documentation style — the code is done, the log entry isn't.
+
+The backend gained one addition beyond GUIDE.md's original Step 5 plan: `GET /conversations/`
+(`app/api/routes/conversations.py`) lists the current user's conversations with the other
+participant's info, presence, and last message — needed because the frontend's conversation
+list has nothing else to fetch from. There is still no way to look up/search other users by
+name or email; starting a new conversation requires knowing the other user's numeric id.
 
 Phase 2 (group chats, read receipts, file uploads, push notifications) and Phase 3 (pgvector
 + Celery + RAG bot participant) are not started; their services (MinIO, Celery worker,
@@ -114,16 +121,36 @@ Key patterns to preserve when extending this code:
 
 ### Frontend (`frontend/`)
 
-Currently the unmodified Next.js App Router scaffold (`create-next-app`, Next 16, React 19,
-Tailwind v4). Step 7 in GUIDE.md lays out the intended structure once built: `app/(auth)/`
-for login/signup, `app/chat/[conversationId]/`, `components/` (ConversationList, MessageList,
-MessageInput), `lib/` (api.ts, auth.ts, websocket.ts), `types/` mirroring the backend's
-Pydantic schemas.
+Built out per GUIDE.md's Step 7 plan: `app/(auth)/login`, `app/(auth)/signup`, `app/chat/`
+(conversation list), `app/chat/[conversationId]/` (live chat), `components/` (ConversationList,
+MessageList, MessageInput), `lib/` (`config.ts` for `API_BASE_URL`/`WS_BASE_URL`, `auth.ts`,
+`api.ts`, `websocket.ts`), `types/index.ts` mirroring the backend's Pydantic schemas. Root `/`
+just redirects to `/login`.
 
-Planned typing-indicator UX (decided in GUIDE.md, not yet implemented): throttle sends to ~1
-event per 2s while typing (not per-keystroke); on the receiving end, show the indicator on
-each incoming event and auto-hide it via a ~3s local timeout rather than waiting for an
-explicit "stopped typing" event — mirrors the backend presence TTL's self-healing approach.
+- **Tokens live in `localStorage`** (`lib/auth.ts`), matching GUIDE.md's own note for this
+  practice phase. `apiJson`/`apiFetch` (`lib/api.ts`) attach the access token and retry once
+  after a silent refresh on a 401.
+- **The current user id is read from the JWT `sub` claim client-side** (`getCurrentUserId()` in
+  `lib/auth.ts`), decoded locally without verifying the signature — fine since every real
+  request is re-authenticated by the backend anyway.
+- **`lib/websocket.ts`'s `useChatSocket` hook** opens one WebSocket per conversation and
+  implements the typing throttle/timeout design from GUIDE.md: sends are throttled to ~1 event
+  per 2s, and the receiving side auto-hides its "Typing…" indicator after ~3s of silence rather
+  than waiting for an explicit "stopped typing" event — mirrors the backend presence TTL's
+  self-healing approach.
+- **The backend never echoes a sent message back to its own sender** (`chat.py` only relays to
+  the *other* participant) — so `app/chat/[conversationId]/page.tsx`'s `handleSend` appends the
+  outgoing message to local state itself rather than waiting on the socket.
+- **Reading `localStorage` during render breaks hydration.** The conversation page needs the
+  current user id to render, but `getCurrentUserId()` is a browser-only read — computing it
+  inline mismatches SSR (always `null`) against the client's first render (a real id). Fixed
+  with `useSyncExternalStore(subscribe, getCurrentUserId, () => null)`, which is also what the
+  stricter `eslint-plugin-react-hooks` rules want instead of a `setState` call directly in a
+  `useEffect` body. Any future client component that reads browser-only storage during render
+  should follow the same pattern.
+- **No user search/lookup endpoint exists.** Starting a new conversation means typing the other
+  user's numeric id directly (`app/chat/page.tsx`) — there's no way to find it except knowing it
+  already (e.g. from the signup response) or checking the DB.
 
 `frontend/CLAUDE.md` / `frontend/AGENTS.md` note that this Next.js version has framework
 changes since training data — check `node_modules/next/dist/docs/` before writing frontend

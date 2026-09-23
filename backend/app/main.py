@@ -5,6 +5,7 @@ from app.db.init_db import init_models
 
 from app.api.routes import auth
 from app.api.routes import conversations
+from app.api.routes import users
 from app.api.ws import chat
 
 @asynccontextmanager
@@ -25,6 +26,7 @@ app.add_middleware(
 app.include_router(auth.router, prefix="/auth", tags=["auth"])
 
 app.include_router(conversations.router, prefix="/conversations", tags=["conversations"])
+app.include_router(users.router, prefix="/users", tags=["users"])
 app.include_router(chat.router)
 
 

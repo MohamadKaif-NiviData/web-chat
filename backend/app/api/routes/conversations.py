@@ -1,59 +1,4 @@
-# Why: creating a conversation and fetching message history are normal
-# request/response HTTP operations — no persistent connection needed, so
-# they get their own regular FastAPI routes (unlike the WebSocket in
-# app/api/ws/chat.py).
-#
-# Plain-English steps:
-# 1. Import `APIRouter`, `HTTPException`, `Depends`, `Query` from `fastapi`;
-#    `AsyncSession` from `sqlalchemy.ext.asyncio`; `select` from
-#    `sqlalchemy`; `get_db` from `app.db.session`; `get_current_user` from
-#    `app.api.deps`; `User` from `app.models.user`; `Conversation`,
-#    `Participant` from `app.models.conversation`; `Message` from
-#    `app.models.message`; `MessageResponse`, `MessagePage` from
-#    `app.schemas.message`.
-# 2. `router = APIRouter()`.
-#
-# 3. Create/get conversation —
-#    `@router.post("/", response_model=...)` (define a small inline
-#    response, or reuse an existing shape — e.g. just return the
-#    conversation id: `{"conversation_id": int}`):
-#    - Take `other_user_id: int` (e.g. via a tiny request body model) and
-#      `current_user: User = Depends(get_current_user)`,
-#      `db: AsyncSession = Depends(get_db)`.
-#    - Find an existing conversation between exactly these two users: query
-#      `Participant` for conversation ids where `user_id == current_user.id`,
-#      then check which of those conversation ids ALSO have a `Participant`
-#      row for `user_id == other_user_id`. (One way: two queries and
-#      intersect the id sets in Python — simplest to read while learning;
-#      a single SQL join/subquery is the more "production" version once
-#      you're comfortable.)
-#    - If found, return that conversation's id.
-#    - If not found: create a new `Conversation()`, `db.add`, `commit`,
-#      `refresh` (to get its id), then create TWO `Participant` rows (one
-#      for `current_user.id`, one for `other_user_id`) pointing at it,
-#      `db.add` both, `commit`. Return the new conversation's id.
-#
-# 4. Message history —
-#    `@router.get("/{conversation_id}/messages", response_model=MessagePage)`:
-#    - Take `conversation_id: int` (path), `cursor: int | None = Query(None)`,
-#      `limit: int = Query(20)`, `current_user`, `db` as above.
-#    - AUTHORIZATION CHECK FIRST: query `Participant` to confirm
-#      `current_user.id` is actually a participant of `conversation_id` — if
-#      not, raise `HTTPException(status_code=403)`. Never trust the URL
-#      alone to prove someone's allowed to read a conversation's messages.
-#    - Query `Message` where `conversation_id` matches, adding
-#      `Message.id < cursor` if `cursor` was given, ordered by
-#      `Message.id.desc()`, limited to `limit + 1` rows.
-#    - If you got back more than `limit` rows: `next_cursor` = the id of the
-#      row at index `limit - 1` (the last one you're actually returning),
-#      and drop the extra row before returning. If you got back `limit` or
-#      fewer: `next_cursor = None` (no more pages).
-#    - Return a `MessagePage(messages=..., next_cursor=...)`.
-#    - Why this is "keyset" pagination and not `OFFSET`: filtering by
-#      "id less than the last one you saw" stays fast no matter how far back
-#      you page, since Postgres can jump straight there using the index;
-#      `OFFSET n` gets slower the deeper you paginate, since the db still
-#      has to scan and discard every skipped row first.
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -64,9 +9,58 @@ from app.models.user import User
 from app.models.conversation import Conversation, Participant
 from app.models.message import Message
 from app.schemas.message import MessageResponse, MessagePage
-from app.schemas.conversation import ConversationResponse
+from app.schemas.conversation import ConversationResponse, ConversationSummary, ParticipantSummary
+from app.services.presence import is_online
 
 router = APIRouter()
+
+
+@router.get("/", response_model=list[ConversationSummary])
+async def list_conversations(current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(Participant.conversation_id).where(Participant.user_id == current_user.id)
+    )
+    conversation_ids = [row[0] for row in result.fetchall()]
+
+    summaries = []
+    for conversation_id in conversation_ids:
+        other_result = await db.execute(
+            select(User)
+            .join(Participant, Participant.user_id == User.id)
+            .where(
+                Participant.conversation_id == conversation_id,
+                Participant.user_id != current_user.id,
+            )
+        )
+        other_user = other_result.scalar_one_or_none()
+        if other_user is None:
+            # No other participant left (e.g. a self-conversation edge case) — skip it.
+            continue
+
+        last_message_result = await db.execute(
+            select(Message)
+            .where(Message.conversation_id == conversation_id)
+            .order_by(Message.id.desc())
+            .limit(1)
+        )
+        last_message = last_message_result.scalar_one_or_none()
+
+        summaries.append(
+            ConversationSummary(
+                conversation_id=conversation_id,
+                other_user=ParticipantSummary(
+                    id=other_user.id,
+                    email=other_user.email,
+                    display_name=other_user.display_name,
+                    is_online=await is_online(other_user.id),
+                ),
+                last_message=MessageResponse.model_validate(last_message) if last_message else None,
+            )
+        )
+
+    epoch = datetime.min.replace(tzinfo=timezone.utc)
+    summaries.sort(key=lambda s: s.last_message.created_at if s.last_message else epoch, reverse=True)
+    return summaries
 
 @router.post("/", response_model=ConversationResponse)
 async def create_or_get_conversation(other_user_id: int, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
