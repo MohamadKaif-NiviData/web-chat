@@ -51,6 +51,29 @@ async def chat_endpoint(
     await set_online(user_id)
     heartbeat_task = asyncio.create_task(_presence_heartbeat(user_id))
 
+    # Why: both the typing-relay branch and the real-message-relay branch
+    # below currently compute "the ONE other participant" and send only to
+    # them (scalar_one_or_none()). That assumes exactly 2 participants —
+    # the moment a third person joins a conversation, this query returns
+    # more than one row and scalar_one_or_none() raises MultipleResultsFound,
+    # crashing the whole WebSocket connection (hit and confirmed during
+    # Step 7 testing with a degenerate self-conversation). Group chats need
+    # "loop over EVERY other participant," which fixes that crash as a
+    # side effect.
+    #
+    # Plain-English steps to rewrite this block:
+    # 1. Change the query below to fetch ALL other participants, not one:
+    #    drop `.scalar_one_or_none()`, use `.scalars().all()` — rename
+    #    `other_user_id` to something like `other_user_ids` (now a list).
+    # 2. Wherever the code did
+    #    `if other_user_id is not None: await manager.send_to_user(other_user_id, payload)`,
+    #    change it to a loop:
+    #    `for uid in other_user_ids: await manager.send_to_user(uid, payload)`.
+    #    This applies to BOTH the typing branch and the message branch below
+    #    — they each need the same fix.
+    # 3. Nothing else in this function (connect/disconnect/presence/
+    #    heartbeat) needs to change — group chats don't change how any ONE
+    #    user's socket behaves, only how many people a message fans out to.
     try:
         while True:
             data = await websocket.receive_json()
@@ -61,12 +84,12 @@ async def chat_endpoint(
                     Participant.user_id != user_id,
                 )
             )
-            other_user_id = other.scalar_one_or_none()
+            other_user_ids = other.scalars().all()
 
             if data.get("type") == "typing":
-                if other_user_id is not None:
+                for uid in other_user_ids:
                     await manager.send_to_user(
-                        other_user_id, {"type": "typing", "user_id": user_id}
+                        uid, {"type": "typing", "user_id": user_id}
                     )
                 continue
 
@@ -79,9 +102,9 @@ async def chat_endpoint(
             await db.commit()
             await db.refresh(message)
 
-            if other_user_id is not None:
-                payload = MessageResponse.model_validate(message).model_dump(mode="json")
-                await manager.send_to_user(other_user_id, payload)
+            payload = MessageResponse.model_validate(message).model_dump(mode="json")
+            for uid in other_user_ids:
+                await manager.send_to_user(uid, payload)
     except WebSocketDisconnect:
         pass
 

@@ -6,12 +6,22 @@ import type { Message } from "@/types";
 interface MessageListProps {
   messages: Message[];
   currentUserId: number;
-  isOtherTyping: boolean;
+  isGroup: boolean;
+  participantsById: Record<number, string>;
+  typingLabel: string | null;
   onLoadOlder: () => void;
   hasMore: boolean;
 }
 
-export function MessageList({ messages, currentUserId, isOtherTyping, onLoadOlder, hasMore }: MessageListProps) {
+export function MessageList({
+  messages,
+  currentUserId,
+  isGroup,
+  participantsById,
+  typingLabel,
+  onLoadOlder,
+  hasMore,
+}: MessageListProps) {
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -32,7 +42,12 @@ export function MessageList({ messages, currentUserId, isOtherTyping, onLoadOlde
         {messages.map((message) => {
           const isMine = message.sender_id === currentUserId;
           return (
-            <div key={message.id} className={`flex ${isMine ? "justify-end" : "justify-start"}`}>
+            <div key={message.id} className={`flex flex-col ${isMine ? "items-end" : "items-start"}`}>
+              {isGroup && !isMine && (
+                <span className="mb-0.5 px-1 text-xs text-zinc-500">
+                  {participantsById[message.sender_id] ?? "Unknown"}
+                </span>
+              )}
               <div
                 className={`max-w-xs rounded-2xl px-4 py-2 text-sm ${
                   isMine ? "bg-foreground text-background" : "bg-zinc-100 dark:bg-zinc-800"
@@ -44,7 +59,7 @@ export function MessageList({ messages, currentUserId, isOtherTyping, onLoadOlde
           );
         })}
       </div>
-      {isOtherTyping && <p className="mt-2 text-xs italic text-zinc-500">Typing…</p>}
+      {typingLabel && <p className="mt-2 text-xs italic text-zinc-500">{typingLabel}</p>}
       <div ref={bottomRef} />
     </div>
   );

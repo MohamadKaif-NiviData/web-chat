@@ -18,13 +18,16 @@ WebSocket chat with pagination → presence/typing → frontend auth + chat UI.
 | 4 — Auth endpoints | ✅ Done |
 | 5 — 1-to-1 WebSocket chat + pagination | ✅ Done |
 | 6 — Presence & typing indicators (Redis) | ✅ Done |
-| 7 — Frontend: auth + chat UI | ⬜ Not started |
+| 7 — Frontend: auth + chat UI | ✅ Done |
+| 8 — Backend: group chats (Phase 2) | ✅ Done |
+| 9 — Frontend: group chats (Phase 2) | ✅ Done |
+| 10 — Backend: read receipts (Phase 2) | ⬜ Not started |
+| 11 — Frontend: read receipts (Phase 2) | ⬜ Not started |
 
-**Next up: Step 4** — Step 3 is fully done: `users`, `conversations`,
-`participants`, `messages` all created automatically via
-`Base.metadata.create_all()` on startup. Time to build the auth endpoints:
-`app/schemas/user.py`, `app/schemas/auth.py`, `app/api/deps.py`,
-`app/api/routes/auth.py`.
+**Next up: Step 10** — Group chats are fully done and verified end-to-end
+(group creation, live fan-out to every member, sender names, multi-user
+typing, all working live in the browser with a real 3-person group). Read
+receipts is next, see the Step 10 write-up below.
 
 ---
 
@@ -796,8 +799,419 @@ update, reload and confirm history + pagination works.
 
 ---
 
-## After Phase 1
+## Step 8 — Group chats (Phase 2)
 
-Once every checkpoint above passes, Phase 1 (MVP) is done. Come back and I'll
-write the same style of guide for Phase 2 (group chats, read receipts, file
-uploads, push notifications).
+Phase 2 scope (from PLAN.md): group chats → read receipts → file uploads →
+push notifications. Doing one feature at a time — this step is group chats
+ONLY. Read receipts (the `message_reads` table, the mark-as-read endpoint,
+the "Seen" indicator) is deliberately deferred to its own later step, not
+bundled in here.
+
+> **Schema decision, discussed and confirmed before writing this step**: no
+> new `groups` table. A group is just a `Conversation` with `is_group=True`
+> and a `name` — `Participant` already links any number of users to a
+> conversation with zero changes needed (it was built as a proper
+> many-to-many linking table from Step 3 on, specifically so this wouldn't
+> require a schema migration later). The alternative — a `groups` table with
+> a single `user_id` foreign key column — can't actually represent more than
+> one member per group (a column holds one value; representing 3 members
+> would mean 3 rows that all claim to be "the same group," which breaks the
+> moment something needs to reference "the group" as one thing). `messages`
+> also needs zero changes: `conversation_id` already says which
+> conversation/group a message belongs to, `sender_id` already says who sent
+> it, regardless of how many people are in that conversation.
+
+> **Decision on group creation UX**: a name field + repeatedly adding member
+> emails (reuse the existing `/users/lookup` idea, but resolved server-side
+> in one shot rather than N separate frontend round trips — see the new
+> endpoint below).
+
+> **Bug this step also forces you to fix**: `app/api/ws/chat.py`'s message
+> and typing relay currently do
+> `select(Participant.user_id).where(...).scalar_one_or_none()` — that
+> assumes there is EXACTLY one other participant. The moment a third person
+> joins a conversation, that query returns more than one row and
+> `scalar_one_or_none()` raises `MultipleResultsFound`, which crashes the
+> whole WebSocket connection (this was hit and confirmed during Step 7
+> testing with a degenerate self-conversation). Group chats need this
+> rewritten as "loop over every other participant," which fixes the crash as
+> a side effect.
+
+**Create/modify inside `backend/app/`:**
+```
+app/
+├── models/
+│   └── conversation.py   (modify)
+├── schemas/
+│   └── conversation.py    (modify)
+└── api/
+    ├── routes/
+    │   └── conversations.py  (modify)
+    └── ws/
+        └── chat.py           (modify)
+```
+
+**`app/models/conversation.py`** (modify)
+Why: `Conversation` currently has no way to say "this is a group" or to
+store a group name — every conversation today is implicitly 1-to-1.
+`Participant` already needs ZERO changes — it's already a plain join table
+between conversations and users, so it already supports any number of
+members per conversation.
+Plain-English steps:
+- Add `is_group: Mapped[bool] = mapped_column(Boolean, default=False)` to
+  `Conversation` (needs `Boolean` added to the `sqlalchemy` import).
+- Add `name: Mapped[str | None] = mapped_column(String, nullable=True)` —
+  null for 1-to-1 conversations (the frontend will show the other person's
+  display name instead, computed by the backend, not stored).
+- Because table creation only happens via `create_all()` (no Alembic), and
+  the `conversations` table already exists with data in it from Phase 1
+  testing: either run `docker compose down -v` to drop and recreate
+  everything fresh, or manually run
+  `ALTER TABLE conversations ADD COLUMN is_group BOOLEAN DEFAULT false;` and
+  `ALTER TABLE conversations ADD COLUMN name VARCHAR;` against Postgres —
+  same trade-off documented back in Step 3.
+
+**`app/schemas/conversation.py`** (modify)
+Why: `ConversationSummary` currently has a single `other_user` field, which
+only makes sense for exactly-2-participant conversations. Groups need a
+shape that works for both cases without the frontend having to special-case
+everything.
+Plain-English steps:
+- Replace `ConversationSummary`'s `other_user: ParticipantSummary` field
+  with:
+  - `is_group: bool`
+  - `name: str` — for a group, the stored group name; for a 1-to-1, the
+    OTHER participant's `display_name` (computed by the route, never stored
+    for 1-to-1s).
+  - `participants: list[ParticipantSummary]` — for a 1-to-1, a list with
+    just the other person; for a group, everyone except the current user.
+- Add `class GroupCreateRequest(BaseModel): name: str; member_emails: list[str]`
+  — the request body for creating a group (see the route below).
+
+**`app/api/routes/conversations.py`** (modify)
+Why: every conversation-shaped read/write already lives here; groups are
+more endpoints on the same resource, not a new subsystem.
+
+1. **Group creation** — `POST /conversations/group`
+   (body: `GroupCreateRequest`, behind `get_current_user`):
+   - Look up every email in `member_emails` (same query `/users/lookup`
+     already uses). If ANY email doesn't resolve to a user, fail the whole
+     request with 404 listing which email(s) — don't create a half-formed
+     group. (All-or-nothing, not partial success.)
+   - Create one `Conversation(is_group=True, name=payload.name)`, commit,
+     refresh to get its id.
+   - Create a `Participant` row for `current_user.id` AND for every resolved
+     member id, `add_all`, commit.
+   - Return the same `ConversationResponse` shape the 1-to-1 endpoint
+     already returns (`{"conversation_id": ...}`) — the frontend doesn't
+     need to know or care whether what it just created is a group.
+
+2. **List conversations** — rewrite the existing `GET /conversations/`:
+   - For each conversation the user's in, fetch `is_group` and the stored
+     `name` off the `Conversation` row itself (you'll need to actually
+     `SELECT` the `Conversation`, not just `Participant.conversation_id`
+     like before).
+   - Fetch ALL other participants (drop the implicit "there's only one"
+     assumption): `select(User).join(Participant, ...).where(conversation_id == X, user_id != current_user.id)`
+     — no `.scalar_one_or_none()`, this can legitimately return many rows
+     now; use `.scalars().all()`.
+   - Build the summary's `name`: if `is_group`, use the conversation's own
+     `name`; if not, use the (single) other participant's `display_name`.
+   - Last message + sort-by-recency logic stays the same as before.
+
+3. **Conversation detail** — new `GET /conversations/{conversation_id}`:
+   - Same authorization check as the message-history endpoint (current user
+     must be a participant, else 403).
+   - Returns the same `ConversationSummary` shape as one item from the list
+     endpoint. Why this needs to exist separately from the list endpoint:
+     the frontend's conversation page only knows the `conversationId` from
+     the URL — it has no cheap way to get THIS conversation's participant
+     names (for showing "Alice: hello" style sender labels in a group) or
+     group name for the header bar, without either re-fetching the whole
+     list and filtering client-side, or a dedicated single-conversation
+     route. The dedicated route is simpler and cheaper.
+
+**`app/api/ws/chat.py`** (modify)
+Why: this is the bug-fix + the feature. Both the message-send path and the
+typing-event path currently do "find the ONE other participant" — both need
+to become "find ALL other participants, send to each."
+Plain-English steps:
+- Wherever the code does
+  `other = await db.execute(select(Participant.user_id).where(conversation_id == X, user_id != user_id)); other_user_id = other.scalar_one_or_none()`,
+  change it to fetch all of them: `other_user_ids = (await db.execute(...)).scalars().all()`.
+- Everywhere that used to do
+  `if other_user_id is not None: await manager.send_to_user(other_user_id, payload)`,
+  change to a loop: `for uid in other_user_ids: await manager.send_to_user(uid, payload)`.
+  This applies to BOTH the typing-relay branch and the real-message-relay
+  branch — they each currently compute their own "other" independently, so
+  both need the same fix.
+- Nothing else about the connect/disconnect/presence/heartbeat logic needs
+  to change — group chats don't change how any ONE user's socket behaves,
+  only how many people a message fans out to.
+
+**Checkpoint**: with two existing users, create a group with a third
+(fresh) user via the new endpoint. Open three WebSocket connections (three
+browser tabs / accounts). Confirm a message sent by any one of them arrives
+live on the OTHER TWO — not just one. Send a `{"type": "typing"}` event from
+one tab and confirm BOTH other tabs show a typing indicator.
+
+---
+
+## Step 9 — Frontend: group chats
+
+**Modify inside `frontend/`:**
+```
+types/index.ts
+lib/websocket.ts
+app/chat/page.tsx
+app/chat/[conversationId]/page.tsx
+components/ConversationList.tsx
+components/MessageList.tsx
+```
+
+**`types/index.ts`**
+Plain-English flow:
+- `ConversationSummary`: replace `other_user: ParticipantSummary` with
+  `is_group: boolean`, `name: string`, `participants: ParticipantSummary[]`
+  — mirrors the backend schema change exactly.
+
+**`app/chat/page.tsx`**
+Plain-English flow:
+- Add a second small form alongside the existing 1-to-1 "start conversation"
+  one: a name input, an email input + "Add" button that appends to a local
+  list of pending member emails (rendered as removable chips/tags), and a
+  "Create group" button that POSTs `{name, member_emails}` to
+  `/conversations/group`, then navigates to the returned `conversation_id`
+  — same as the 1-to-1 flow already does.
+
+**`components/ConversationList.tsx`**
+Plain-English flow:
+- Render `conversation.name` as the title (already correct for both cases
+  since the backend computes it).
+- Online dot: show it if ANY entry in `conversation.participants` has
+  `is_online: true` — this happens to work unchanged for 1-to-1 (exactly
+  one participant) and now also makes sense for groups (dot means "someone
+  in this group is online").
+
+**`app/chat/[conversationId]/page.tsx`**
+Plain-English flow:
+- On load, also fetch `GET /conversations/${conversationId}` to get
+  `is_group`, `name`, and `participants` — store in state, use `name` in the
+  header bar (replacing the current bare "← Back" only header) and build a
+  quick `id -> display_name` lookup map from `participants` for rendering
+  sender names.
+- Pass that lookup map down to `MessageList` so it can show a sender name
+  above/beside bubbles that aren't the current user's (skip this for 1-to-1
+  where it's not needed — there's only one other person).
+- Typing indicator: replace the single `isOtherTyping: boolean` with a
+  `Set<number>` of currently-typing user ids (still auto-cleared per-user
+  after the same ~3s timeout as before — track a timeout per user id, not
+  one global timeout, or two people typing at once will incorrectly clear
+  each other's indicator early). Render "X is typing…" for one person,
+  "X and Y are typing…" for two, "Several people are typing…" beyond that —
+  using the participants lookup map for names.
+
+**`components/MessageList.tsx`**
+Plain-English flow:
+- Accept a `participantsById: Record<number, string>` prop and an
+  `isGroup: boolean` prop.
+- When `isGroup` and a message isn't the current user's, render the
+  sender's display name (looked up via `participantsById[message.sender_id]`)
+  in small text above that bubble.
+
+**Checkpoint**: three signed-up users, one creates a group with the other
+two by email. All three see it in their chat list with the right name and
+an online dot. Messages sent by any one appear live for the other two, with
+the sender's name shown on incoming group messages. Typing from two people
+at once shows both names.
+
+## Step 10 — Backend: read receipts (Phase 2)
+
+> **Decisions locked in before writing this step**:
+> - **Granularity**: per-message, per-user (a `message_reads` table) — not a
+>   single `last_read_message_id` pointer. A pointer can't express "Alice's
+>   read message 40, Bob's only read message 38" once a conversation has more
+>   than 2 people in it.
+> - **When a message counts as read**: as soon as it's loaded into a
+>   conversation the user has open (on the initial history fetch, and again
+>   for each new message that arrives live) — not precise scroll-into-view
+>   tracking. Simpler, and "the conversation is open" is a reasonable
+>   approximation of "seen" for a practice project.
+> - **UI**: a small "Seen" text label under your own message, once every
+>   OTHER participant has read it — same plain-text style as the typing
+>   indicator, no new icons.
+
+**Create/modify inside `backend/app/`:**
+```
+app/
+├── models/
+│   └── message_read.py    (new)
+├── db/
+│   └── base.py             (modify — import message_read)
+├── schemas/
+│   └── message.py          (modify)
+└── api/
+    └── routes/
+        └── conversations.py (modify)
+```
+
+**`app/models/message_read.py`** (new)
+Why: read receipts need to answer "which specific users have read this
+specific message" — a many-to-many relationship between messages and users
+(one message can be read by many users; one user reads many messages) —
+same reasoning as `Participant` linking users to conversations. This is a
+genuinely new table, unlike group chats which reused `Conversation` — there
+is no existing table this data could live on.
+Plain-English steps:
+- `class MessageRead(Base):` with `__tablename__ = "message_reads"`:
+  - `id: Mapped[int] = mapped_column(primary_key=True)`
+  - `message_id: Mapped[int] = mapped_column(ForeignKey("messages.id"))`
+  - `user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))`
+  - `read_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())`
+- Add `__table_args__ = (UniqueConstraint("message_id", "user_id"),)` inside
+  the class body — the DB itself refuses a second read-row for the same
+  (message, user) pair. This is a safety net, not the primary mechanism —
+  the route below checks first and only inserts what's missing, so the
+  constraint mostly guards against a rare double-submit race rather than
+  being relied on for every insert. Import `UniqueConstraint` from
+  `sqlalchemy` alongside the other imports already used in the model files.
+- No Alembic in this project (Step 3) — this is a brand new table though,
+  so `create_all()` on the next startup creates it automatically. No manual
+  `ALTER TABLE` needed here (unlike Step 8's columns on an existing table).
+
+**`app/db/base.py`** (modify)
+Why: same reasoning as every other model — a table that's never imported
+never registers on `Base.metadata`, so `create_all()` won't create it.
+Plain-English steps:
+- Add `message_read` to the bottom-of-file import line:
+  `from app.models import user, conversation, message, message_read`.
+
+**`app/schemas/message.py`** (modify)
+Why: a message bubble needs to know who's read it to decide whether to show
+"Seen".
+Plain-English steps:
+- Add `read_by: list[int] = []` to `MessageResponse` — the user ids that
+  have a `MessageRead` row for this message. This is never a real column on
+  `Message` — it gets filled in by the route when building the response
+  (see below), same idea as `is_online` being computed rather than stored.
+
+**`app/api/routes/conversations.py`** (modify)
+Why: read state is fetched alongside message history, and marked via a new
+endpoint on the same conversation resource — no new subsystem needed.
+
+1. **Populate `read_by` on `get_message_history`**:
+   - After fetching the page of `Message` rows (existing code), collect
+     their ids, then run ONE query:
+     `select(MessageRead.message_id, MessageRead.user_id).where(MessageRead.message_id.in_(these_ids))`.
+   - Build a `dict[int, list[int]]` mapping `message_id -> [user_id, ...]`
+     from those rows (a plain Python loop appending to
+     `defaultdict(list)` works fine).
+   - When constructing each `MessageResponse`, pass
+     `read_by=read_by_map.get(message.id, [])`.
+   - Why one batched query instead of one query per message: the same
+     N+1-query trap this codebase has avoided everywhere else (see how
+     `list_conversations` fetches all participants and all conversations
+     up front rather than per-row).
+
+2. **Mark messages read** — new `POST /conversations/{conversation_id}/messages/read`
+   (body: `{"message_ids": list[int]}`, behind `get_current_user`):
+   - Authorization check — current user must be a `Participant` of
+     `conversation_id`, same pattern as every other route here.
+   - Find which of the requested `message_ids` this user has ALREADY read:
+     `select(MessageRead.message_id).where(MessageRead.user_id == current_user.id, MessageRead.message_id.in_(message_ids))`
+     — call the result `already_read` (a set).
+   - For every id in `message_ids` that ISN'T in `already_read`, create a
+     `MessageRead(message_id=..., user_id=current_user.id)`, `add_all`,
+     `await db.commit()` (remember: `add`/`add_all` are sync, `commit` and
+     `refresh` are the ones that need `await` — the exact mix-up from
+     Step 8's group endpoint).
+   - Only for the ids that were newly marked (not the ones already read —
+     no point re-announcing something already known): fetch every OTHER
+     participant of this conversation (identical query to the one already
+     rewritten in `chat.py` for group fan-out — `Participant.user_id != current_user.id`)
+     and for each newly-read message id, loop over those other participants
+     calling `await manager.send_to_user(uid, {"type": "read", "message_id": message_id, "user_id": current_user.id})`.
+     This needs `from app.services.connection_manager import manager`
+     added to this file's imports.
+   - Return something minimal — a 204 with no body, or
+     `{"marked": [ids that were newly read]}` — the frontend doesn't
+     strictly need the response since it already knows what it asked to
+     mark.
+
+**Checkpoint**: open a conversation as one user, send a couple of messages
+from a second user (script or second tab), then call the mark-read endpoint
+as the first user with those message ids. Re-fetch the conversation's
+history and confirm `read_by` now includes the first user's id on those
+messages. With both users' sockets open, confirm the SECOND user's socket
+receives a `{"type": "read", ...}` event the moment the first user marks
+them read — live, no refetch needed.
+
+---
+
+## Step 11 — Frontend: read receipts (Phase 2)
+
+**Modify inside `frontend/`:**
+```
+types/index.ts
+lib/websocket.ts
+app/chat/[conversationId]/page.tsx
+components/MessageList.tsx
+```
+
+**`types/index.ts`**
+Plain-English flow:
+- `Message`: add `read_by: number[]`.
+- Add `export type ReadEvent = { type: "read"; message_id: number; user_id: number };`
+  alongside the existing `TypingEvent`.
+
+**`lib/websocket.ts`**
+Plain-English flow:
+- `useChatSocket`'s handlers object gains a third callback:
+  `onRead: (messageId: number, userId: number) => void`.
+- In `onmessage`, the branching currently checks
+  `if (data.type === "typing") { ... } else { ...treat as Message... }`.
+  Add a middle branch: `else if (data.type === "read") { handlersRef.current.onRead(data.message_id, data.user_id); }`
+  — same pattern as the typing branch, just a different `type` value and a
+  different handler.
+
+**`app/chat/[conversationId]/page.tsx`**
+Plain-English flow:
+- Wire up `onRead` in the `useChatSocket(...)` call: find the message with
+  that `message_id` in local `messages` state and add `user_id` to its
+  `read_by` array (if not already present) — a `setMessages` update mapping
+  over the array, same shape as `onMessage`/`onTyping` already use.
+- Mark-as-read triggering (per the "on load + on arrival" decision):
+  - Right after the initial `Promise.all([...])` history fetch resolves,
+    call the mark-read endpoint once with the ids of every loaded message
+    NOT sent by the current user (`messages.filter(m => m.sender_id !== currentUserId).map(m => m.id)`)
+    — no point marking your own messages as read.
+  - In the `onMessage` handler (a new message arriving live), after adding
+    it to state, if `message.sender_id !== currentUserId` call the
+    mark-read endpoint again with just that one new message's id. Small
+    payloads, no batching needed for a single incoming message.
+  - Both of these are just `apiJson(`/conversations/${conversationId}/messages/read`, { method: "POST", body: JSON.stringify({ message_ids: [...] }) })`
+    calls — fire-and-forget is fine here (no need to block the UI on the
+    response).
+
+**`components/MessageList.tsx`**
+Plain-English flow:
+- Accept an `otherParticipantIds: number[]` prop (the ids of every OTHER
+  participant in this conversation — for a 1-to-1 that's a list of one; for
+  a group, everyone but you. `conversation.participants.map(p => p.id)`
+  from the parent already gives you exactly this).
+- For messages where `isMine` is true, compute
+  `const seenByEveryone = otherParticipantIds.every(id => message.read_by.includes(id))`.
+  When `seenByEveryone` is true, render a small "Seen" label under that
+  bubble (same styling as the existing typing-indicator text — muted, small,
+  italic optional).
+- Messages that aren't yours never show a read indicator — read receipts
+  are about "did THEY read MY message," not the reverse.
+
+**Checkpoint**: two users in a 1-to-1, or three in a group. Send a message —
+sender sees no "Seen" yet. Have every OTHER participant open the
+conversation (triggering the on-load mark-read call) — the sender's message
+flips to "Seen" live, without reloading. Send a second message while
+everyone already has the conversation open — it should flip to "Seen"
+almost immediately (the on-arrival mark-read firing on each recipient's
+client). Reload the page entirely and confirm the "Seen" state persists
+(comes back from `read_by` on the history fetch, not just live state).

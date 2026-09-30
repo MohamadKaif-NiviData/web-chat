@@ -1,15 +1,23 @@
 "use client";
 
-import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { apiJson } from "@/lib/api";
 import { isAuthenticated, getCurrentUserId } from "@/lib/auth";
 import { useChatSocket } from "@/lib/websocket";
 import { MessageList } from "@/components/MessageList";
 import { MessageInput } from "@/components/MessageInput";
-import type { Message, MessagePage } from "@/types";
+import type { ConversationSummary, Message, MessagePage } from "@/types";
 
 const TYPING_TIMEOUT_MS = 3000;
+
+function buildTypingLabel(typingUserIds: Set<number>, participantsById: Record<number, string>): string | null {
+  if (typingUserIds.size === 0) return null;
+  const names = Array.from(typingUserIds).map((id) => participantsById[id] ?? "Someone");
+  if (names.length === 1) return `${names[0]} is typing…`;
+  if (names.length === 2) return `${names[0]} and ${names[1]} are typing…`;
+  return "Several people are typing…";
+}
 
 export default function ConversationPage() {
   const params = useParams<{ conversationId: string }>();
@@ -27,39 +35,64 @@ export default function ConversationPage() {
     () => null,
   );
 
+  const [conversation, setConversation] = useState<ConversationSummary | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [nextCursor, setNextCursor] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [isOtherTyping, setIsOtherTyping] = useState(false);
-  const typingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [typingUserIds, setTypingUserIds] = useState<Set<number>>(new Set());
+  const typingTimeoutsRef = useRef<Map<number, ReturnType<typeof setTimeout>>>(new Map());
+
+  const participantsById = useMemo(() => {
+    const map: Record<number, string> = {};
+    conversation?.participants.forEach((p) => {
+      map[p.id] = p.display_name;
+    });
+    return map;
+  }, [conversation]);
 
   useEffect(() => {
     if (!isAuthenticated()) {
       router.replace("/login");
       return;
     }
-    apiJson<MessagePage>(`/conversations/${conversationId}/messages`)
-      .then((page) => {
+    Promise.all([
+      apiJson<ConversationSummary>(`/conversations/${conversationId}`),
+      apiJson<MessagePage>(`/conversations/${conversationId}/messages`),
+    ])
+      .then(([conversationDetail, page]) => {
+        setConversation(conversationDetail);
         setMessages([...page.messages].reverse());
         setNextCursor(page.next_cursor);
       })
-      .catch((err) => setError(err instanceof Error ? err.message : "Failed to load messages"))
+      .catch((err) => setError(err instanceof Error ? err.message : "Failed to load conversation"))
       .finally(() => setLoading(false));
   }, [conversationId, router]);
 
   const { sendMessage, sendTyping } = useChatSocket(conversationId, {
     onMessage: (message) => setMessages((prev) => [...prev, message]),
-    onTyping: () => {
-      setIsOtherTyping(true);
-      if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
-      typingTimeoutRef.current = setTimeout(() => setIsOtherTyping(false), TYPING_TIMEOUT_MS);
+    onTyping: (userId) => {
+      setTypingUserIds((prev) => new Set(prev).add(userId));
+      const existingTimeout = typingTimeoutsRef.current.get(userId);
+      if (existingTimeout) clearTimeout(existingTimeout);
+      typingTimeoutsRef.current.set(
+        userId,
+        setTimeout(() => {
+          setTypingUserIds((prev) => {
+            const next = new Set(prev);
+            next.delete(userId);
+            return next;
+          });
+          typingTimeoutsRef.current.delete(userId);
+        }, TYPING_TIMEOUT_MS),
+      );
     },
   });
 
   useEffect(() => {
+    const timeouts = typingTimeoutsRef.current;
     return () => {
-      if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+      timeouts.forEach(clearTimeout);
     };
   }, []);
 
@@ -100,6 +133,7 @@ export default function ConversationPage() {
         <button onClick={() => router.push("/chat")} className="text-sm text-zinc-500 underline">
           ← Back
         </button>
+        {conversation && <h1 className="font-medium">{conversation.name}</h1>}
       </div>
 
       {error && <p className="px-4 py-2 text-sm text-red-600">{error}</p>}
@@ -110,7 +144,9 @@ export default function ConversationPage() {
         <MessageList
           messages={messages}
           currentUserId={currentUserId}
-          isOtherTyping={isOtherTyping}
+          isGroup={conversation?.is_group ?? false}
+          participantsById={participantsById}
+          typingLabel={buildTypingLabel(typingUserIds, participantsById)}
           onLoadOlder={handleLoadOlder}
           hasMore={nextCursor !== null}
         />

@@ -27,7 +27,9 @@ export interface ParticipantSummary {
 
 export interface ConversationSummary {
   conversation_id: number;
-  other_user: ParticipantSummary;
+  is_group: boolean;
+  name: string;
+  participants: ParticipantSummary[];
   last_message: Message | null;
 }
 
