@@ -42,6 +42,14 @@ export default function ConversationPage() {
   const [error, setError] = useState<string | null>(null);
   const [typingUserIds, setTypingUserIds] = useState<Set<number>>(new Set());
   const typingTimeoutsRef = useRef<Map<number, ReturnType<typeof setTimeout>>>(new Map());
+  // FIFO queue of this tab's own not-yet-confirmed placeholder ids. chat.py
+  // now echoes every persisted message back to its own sender (see the "Why"
+  // comment there) specifically so the placeholder can be swapped for the
+  // real, database-backed message — read receipts need the REAL id to ever
+  // match a message you sent yourself. Safe to match strictly in send order:
+  // a single WebSocket connection processes/echoes messages in the order
+  // they were sent.
+  const pendingSentIdsRef = useRef<number[]>([]);
 
   const participantsById = useMemo(() => {
     const map: Record<number, string> = {};
@@ -50,6 +58,21 @@ export default function ConversationPage() {
     });
     return map;
   }, [conversation]);
+
+  const otherParticipantIds = useMemo(
+    () => conversation?.participants.map((p) => p.id) ?? [],
+    [conversation],
+  );
+
+  // Fire-and-forget: the UI already knows what it asked to mark, so there's
+  // nothing useful to do with the response beyond ignoring failures.
+  function markRead(messageIds: number[]) {
+    if (messageIds.length === 0) return;
+    apiJson(`/conversations/${conversationId}/messages/read`, {
+      method: "POST",
+      body: JSON.stringify({ message_ids: messageIds }),
+    }).catch(() => {});
+  }
 
   useEffect(() => {
     if (!isAuthenticated()) {
@@ -62,15 +85,44 @@ export default function ConversationPage() {
     ])
       .then(([conversationDetail, page]) => {
         setConversation(conversationDetail);
-        setMessages([...page.messages].reverse());
+        const loaded = [...page.messages].reverse();
+        setMessages(loaded);
         setNextCursor(page.next_cursor);
+        // getCurrentUserId() is read directly here (not the `currentUserId`
+        // state above) because this effect only runs once on mount and its
+        // closure would otherwise capture whatever that value was on the
+        // very first render — which can still be null before hydration
+        // settles it via useSyncExternalStore.
+        const myId = getCurrentUserId();
+        markRead(loaded.filter((m) => m.sender_id !== myId).map((m) => m.id));
       })
       .catch((err) => setError(err instanceof Error ? err.message : "Failed to load conversation"))
       .finally(() => setLoading(false));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [conversationId, router]);
 
   const { sendMessage, sendTyping } = useChatSocket(conversationId, {
-    onMessage: (message) => setMessages((prev) => [...prev, message]),
+    onMessage: (message) => {
+      if (message.sender_id === currentUserId) {
+        // This is the self-echo of a message we sent — swap the oldest
+        // pending placeholder for the confirmed (real-id) message instead
+        // of appending a duplicate.
+        const placeholderId = pendingSentIdsRef.current.shift();
+        setMessages((prev) => prev.map((m) => (m.id === placeholderId ? message : m)));
+        return;
+      }
+      setMessages((prev) => [...prev, message]);
+      markRead([message.id]);
+    },
+    onRead: (messageIds, userId) => {
+      setMessages((prev) =>
+        prev.map((m) =>
+          messageIds.includes(m.id) && !m.read_by.includes(userId)
+            ? { ...m, read_by: [...m.read_by, userId] }
+            : m,
+        ),
+      );
+    },
     onTyping: (userId) => {
       setTypingUserIds((prev) => new Set(prev).add(userId));
       const existingTimeout = typingTimeoutsRef.current.get(userId);
@@ -96,20 +148,25 @@ export default function ConversationPage() {
     };
   }, []);
 
-  // The backend only relays a new message to the OTHER participant (see
-  // chat.py) — it never echoes it back to the sender's own socket — so the
-  // sender has to add their own outgoing message to local state directly.
+  // Optimistically show the message immediately under a fake local id (so
+  // sending feels instant), then reconcile it against chat.py's self-echo
+  // once the real, database-backed message comes back over the socket (see
+  // onMessage above and pendingSentIdsRef's comment) — read receipts need
+  // that real id to ever be able to match your own sent messages.
   function handleSend(content: string) {
     sendMessage(content);
+    const placeholderId = -Date.now();
+    pendingSentIdsRef.current.push(placeholderId);
     setMessages((prev) => [
       ...prev,
       {
-        id: -Date.now(),
+        id: placeholderId,
         conversation_id: conversationId,
         sender_id: currentUserId as number,
         content,
         type: "text",
         created_at: new Date().toISOString(),
+        read_by: [],
       },
     ]);
   }
@@ -146,6 +203,7 @@ export default function ConversationPage() {
           currentUserId={currentUserId}
           isGroup={conversation?.is_group ?? false}
           participantsById={participantsById}
+          otherParticipantIds={otherParticipantIds}
           typingLabel={buildTypingLabel(typingUserIds, participantsById)}
           onLoadOlder={handleLoadOlder}
           hasMore={nextCursor !== null}

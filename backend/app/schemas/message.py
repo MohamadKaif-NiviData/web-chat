@@ -8,8 +8,12 @@ class MessageResponse(BaseModel):
     content: str
     type: str
     created_at: datetime
+    read_by: list[int] = []
     model_config = ConfigDict(from_attributes=True)
 
 class MessagePage(BaseModel):
     messages: list[MessageResponse]
-    next_cursor : int | None    
+    next_cursor : int | None
+
+class MarkReadRequest(BaseModel):
+    message_ids: list[int]

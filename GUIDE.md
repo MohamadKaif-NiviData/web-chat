@@ -21,13 +21,71 @@ WebSocket chat with pagination → presence/typing → frontend auth + chat UI.
 | 7 — Frontend: auth + chat UI | ✅ Done |
 | 8 — Backend: group chats (Phase 2) | ✅ Done |
 | 9 — Frontend: group chats (Phase 2) | ✅ Done |
-| 10 — Backend: read receipts (Phase 2) | ⬜ Not started |
-| 11 — Frontend: read receipts (Phase 2) | ⬜ Not started |
+| 10 — Backend: read receipts (Phase 2) | ✅ Done |
+| 11 — Frontend: read receipts (Phase 2) | ✅ Done |
+| 12 — Backend: file/image uploads (Phase 2) | ⬜ Not started |
+| 13 — Frontend: file/image uploads (Phase 2) | ⬜ Not started |
 
-**Next up: Step 10** — Group chats are fully done and verified end-to-end
-(group creation, live fan-out to every member, sender names, multi-user
-typing, all working live in the browser with a real 3-person group). Read
-receipts is next, see the Step 10 write-up below.
+**Next up: Step 12** — Read receipts are fully done and verified live in the
+browser (two genuinely independent sessions, not same-profile tabs — see the
+gotcha below). File/image uploads via MinIO is next.
+
+> **Step 11 verification, and a real bug it surfaced**: confirmed live in
+> the browser with the Chrome extension, using one real session ("N") plus a
+> backend-minted JWT standing in for a second user — "Seen" appeared
+> instantly under both of N's messages the moment the other user's mark-read
+> call landed, no reload. Getting to that point surfaced a genuine bug, not
+> a Step 11 mistake: **the backend never echoed a sent message back to its
+> own sender** (a deliberate Phase 1 decision), so a sender's own message
+> only ever existed locally under a fake placeholder id (`-Date.now()`) —
+> and a `"read"` event carries the REAL database id, which a fake id can
+> never match. "Seen" was structurally unreachable for your own messages
+> within a live session (a reload masked it, since reloading re-fetches real
+> ids from history). Fixed by reversing that decision: `chat.py` now echoes
+> the persisted message back to the sender's own socket too, and
+> `app/chat/[conversationId]/page.tsx` reconciles its optimistic placeholder
+> against that echo via a FIFO queue (`pendingSentIdsRef`) — see the
+> "Bug hit and fixed" callout inside Step 11 below for the full detail. Also
+> updated `CLAUDE.md`'s architecture notes, since this reversed a pattern
+> documented there.
+>
+> **Testing gotcha worth remembering**: an earlier "it's not working" report
+> turned out to be two Incognito windows of the SAME Chrome instance — Chrome
+> shares one off-the-record session across all its Incognito windows, so
+> both windows were silently sharing one `localStorage`, and logging into
+> the second account overwrote the first window's token. Testing two users
+> live requires either two different browsers, one regular + one Incognito
+> window, or two separate OS-level Chrome profiles — never two Incognito
+> windows of the same browser, and never two tabs of the same window.
+
+> **Step 10 verification** (scripted against the running `docker compose`
+> stack, via `requests` + `websockets` from the host — no manual browser
+> steps, since this is all REST/WS calls): restarted the backend to pick up
+> the new `message_reads` table (confirmed via `\d message_reads` in psql —
+> right columns, the `UniqueConstraint` present as a unique index), then:
+> - 1-to-1: Alice sent 3 messages over WS; `read_by` was `[]` for all 3 on
+>   Bob's history fetch; Bob POSTed all 3 ids to the mark-read route and got
+>   back `{"marked": [...all 3...]}`; Alice's already-open WS connection
+>   received exactly ONE `{"type": "read", "message_ids": [...all 3...],
+>   "user_id": bob.id}` event (confirms the batched-broadcast refinement —
+>   not 3 separate events); re-fetching history afterward showed
+>   `read_by: [bob.id]` on all 3 messages.
+> - Idempotency: re-POSTing the same already-read ids returned
+>   `{"marked": []}` — no duplicate rows, no unique-constraint crash.
+> - Validation refinement: POSTing a message id from nowhere/foreign
+>   (`999999`) returned `{"marked": []}` instead of erroring or inserting
+>   garbage — confirms the "filter message_ids against this
+>   conversation_id" check works.
+> - Self-read exclusion: the SENDER (Alice) POSTing her own message's id
+>   came back `{"marked": []}` — confirms a user can't mark their own
+>   message "read by me."
+> - Group fan-out (3-person group: Alice, Bob, Carol): Carol marking
+>   Alice's message read caused BOTH Bob's and Alice's open sockets to each
+>   receive one `{"type": "read", ...}` event — confirms the "loop over
+>   every other participant" broadcast works for >2 participants, not just
+>   1-to-1.
+> - Checked backend container logs across the whole run — no tracebacks or
+>   errors.
 
 ---
 
@@ -1041,6 +1099,33 @@ at once shows both names.
 >   OTHER participant has read it — same plain-text style as the typing
 >   indicator, no new icons.
 
+> **Refinements added after review** (two gaps closed before writing any  
+> code, both caught by re-reading the mark-read route against patterns this
+> codebase already follows elsewhere):
+> - **Authorization on `message_ids`, not just on `conversation_id`.** The
+>   original draft's mark-read route checked that the current user is a
+>   `Participant` of `conversation_id`, but never checked that the requested
+>   `message_ids` actually BELONG to that conversation. A stale client cache
+>   (or a crafted request) could pass a message id from a different
+>   conversation and silently create a `MessageRead` row for it — nobody
+>   else's message content leaks, but it's still trusting the request body
+>   somewhere this codebase has been careful not to (the "never trust the
+>   URL alone" rule from `chat.py`/the history endpoint applies just as much
+>   to a request body). Fixed by intersecting `message_ids` against
+>   `Message.conversation_id == conversation_id` before doing anything else
+>   with them, and separately excluding the current user's own messages
+>   (marking your own message "read by you" is meaningless).
+> - **Batch the WebSocket broadcast.** The original draft sent one
+>   `{"type": "read", ...}` event per newly-read message, per other
+>   participant — marking 5 messages read at once in a 3-person group meant
+>   10 separate socket sends for a single user action (open the chat once).
+>   Changed to one event per participant carrying the FULL list of
+>   newly-read message ids in a single send
+>   (`{"type": "read", "message_ids": [...], "user_id": ...}`) — same
+>   information, a fraction of the socket traffic, same batching instinct
+>   already used for the `read_by` query in step 1 below. This changes the
+>   event shape Step 11's frontend code needs to handle (updated below too).
+
 **Create/modify inside `backend/app/`:**
 ```
 app/
@@ -1117,26 +1202,34 @@ endpoint on the same conversation resource — no new subsystem needed.
    (body: `{"message_ids": list[int]}`, behind `get_current_user`):
    - Authorization check — current user must be a `Participant` of
      `conversation_id`, same pattern as every other route here.
-   - Find which of the requested `message_ids` this user has ALREADY read:
-     `select(MessageRead.message_id).where(MessageRead.user_id == current_user.id, MessageRead.message_id.in_(message_ids))`
+   - **Validate `message_ids` before touching the database with them** (see
+     the "Refinements added after review" note above for why): run
+     `select(Message.id).where(Message.conversation_id == conversation_id, Message.sender_id != current_user.id, Message.id.in_(message_ids))`
+     and use ONLY the ids that come back — this drops anything that doesn't
+     actually belong to this conversation and anything the current user
+     sent themself, in one query. Call this filtered list `valid_ids`; every
+     step below uses `valid_ids`, never the raw request body.
+   - Find which of `valid_ids` this user has ALREADY read:
+     `select(MessageRead.message_id).where(MessageRead.user_id == current_user.id, MessageRead.message_id.in_(valid_ids))`
      — call the result `already_read` (a set).
-   - For every id in `message_ids` that ISN'T in `already_read`, create a
-     `MessageRead(message_id=..., user_id=current_user.id)`, `add_all`,
-     `await db.commit()` (remember: `add`/`add_all` are sync, `commit` and
-     `refresh` are the ones that need `await` — the exact mix-up from
-     Step 8's group endpoint).
-   - Only for the ids that were newly marked (not the ones already read —
-     no point re-announcing something already known): fetch every OTHER
-     participant of this conversation (identical query to the one already
-     rewritten in `chat.py` for group fan-out — `Participant.user_id != current_user.id`)
-     and for each newly-read message id, loop over those other participants
-     calling `await manager.send_to_user(uid, {"type": "read", "message_id": message_id, "user_id": current_user.id})`.
+   - For every id in `valid_ids` that ISN'T in `already_read` (call this
+     list `newly_read_ids`), create a `MessageRead(message_id=..., user_id=current_user.id)`,
+     `add_all`, `await db.commit()` (remember: `add`/`add_all` are sync,
+     `commit` and `refresh` are the ones that need `await` — the exact
+     mix-up from Step 8's group endpoint).
+   - **Broadcast once per participant, not once per message.** If
+     `newly_read_ids` is empty, skip broadcasting entirely (e.g. everything
+     requested was already read or got filtered out above — no point
+     sending an empty event). Otherwise, fetch every OTHER participant of
+     this conversation (identical query to the one already rewritten in
+     `chat.py` for group fan-out — `Participant.user_id != current_user.id`)
+     and send each of them ONE event carrying the whole batch:
+     `await manager.send_to_user(uid, {"type": "read", "message_ids": newly_read_ids, "user_id": current_user.id})`.
      This needs `from app.services.connection_manager import manager`
      added to this file's imports.
    - Return something minimal — a 204 with no body, or
-     `{"marked": [ids that were newly read]}` — the frontend doesn't
-     strictly need the response since it already knows what it asked to
-     mark.
+     `{"marked": newly_read_ids}` — the frontend doesn't strictly need the
+     response since it already knows what it asked to mark.
 
 **Checkpoint**: open a conversation as one user, send a couple of messages
 from a second user (script or second tab), then call the mark-read endpoint
@@ -1150,10 +1243,41 @@ them read — live, no refetch needed.
 
 ## Step 11 — Frontend: read receipts (Phase 2)
 
+> **Bug hit and fixed while building this step: "Seen" never appeared on
+> your OWN messages, even after the other person genuinely read them.**
+> Root cause: Phase 1 deliberately never echoed a sent message back to its
+> own sender (`chat.py` only relayed to the *other* participant) — the
+> sender's own copy of a message it just sent lived only as a locally-added
+> placeholder under a fake id (`-Date.now()`). That was harmless until now:
+> a `"read"` event carries the REAL database message id, and a placeholder
+> under a fake id can never match against it, so `read_by` could never be
+> updated for a message you sent — "Seen" was permanently unreachable for
+> your own messages within the same session (a full page reload masked
+> this, since reloading re-fetches real ids from history). Fixed by
+> reversing that Phase 1 decision:
+> - **`app/api/ws/chat.py`** (modify): after persisting and relaying a
+>   message to every other participant, also
+>   `await manager.send_to_user(user_id, payload)` — echo it back to the
+>   SENDER's own socket too, carrying the real id.
+> - **`app/chat/[conversationId]/page.tsx`**: `handleSend` still adds the
+>   optimistic placeholder immediately (for instant-feeling sends), but now
+>   also pushes its fake id onto a FIFO queue (`pendingSentIdsRef`). In
+>   `onMessage`, check `message.sender_id === currentUserId` first — if
+>   true, this is the self-echo, so shift the oldest pending id off the
+>   queue and replace that placeholder message with the confirmed one
+>   (`setMessages(prev => prev.map(m => m.id === placeholderId ? message : m))`)
+>   instead of appending a duplicate. FIFO order is safe here because a
+>   single WebSocket connection persists and echoes messages in the exact
+>   order they were sent — no need to match by content.
+> This also updated the "no echo" note in `CLAUDE.md`'s architecture
+> section, since it was a documented pattern that this step deliberately
+> reverses.
+
 **Modify inside `frontend/`:**
 ```
 types/index.ts
 lib/websocket.ts
+app/api/ws/chat.py            (backend — see the self-echo fix above)
 app/chat/[conversationId]/page.tsx
 components/MessageList.tsx
 ```
@@ -1161,25 +1285,30 @@ components/MessageList.tsx
 **`types/index.ts`**
 Plain-English flow:
 - `Message`: add `read_by: number[]`.
-- Add `export type ReadEvent = { type: "read"; message_id: number; user_id: number };`
-  alongside the existing `TypingEvent`.
+- Add `export type ReadEvent = { type: "read"; message_ids: number[]; user_id: number };`
+  alongside the existing `TypingEvent` — plural `message_ids`, matching the
+  batched broadcast decided in Step 10 (one WebSocket event per participant
+  per mark-read call, carrying every newly-read id at once, not one event
+  per message).
 
 **`lib/websocket.ts`**
 Plain-English flow:
 - `useChatSocket`'s handlers object gains a third callback:
-  `onRead: (messageId: number, userId: number) => void`.
+  `onRead: (messageIds: number[], userId: number) => void`.
 - In `onmessage`, the branching currently checks
   `if (data.type === "typing") { ... } else { ...treat as Message... }`.
-  Add a middle branch: `else if (data.type === "read") { handlersRef.current.onRead(data.message_id, data.user_id); }`
+  Add a middle branch: `else if (data.type === "read") { handlersRef.current.onRead(data.message_ids, data.user_id); }`
   — same pattern as the typing branch, just a different `type` value and a
   different handler.
 
 **`app/chat/[conversationId]/page.tsx`**
 Plain-English flow:
-- Wire up `onRead` in the `useChatSocket(...)` call: find the message with
-  that `message_id` in local `messages` state and add `user_id` to its
-  `read_by` array (if not already present) — a `setMessages` update mapping
-  over the array, same shape as `onMessage`/`onTyping` already use.
+- Wire up `onRead` in the `useChatSocket(...)` call: on each incoming
+  `(messageIds, userId)` pair, do ONE `setMessages` update that maps over
+  local `messages` state and, for every message whose `id` is in
+  `messageIds`, adds `userId` to its `read_by` array (if not already
+  present) — same shape as `onMessage`/`onTyping` already use, just checking
+  membership in an array instead of a single id match.
 - Mark-as-read triggering (per the "on load + on arrival" decision):
   - Right after the initial `Promise.all([...])` history fetch resolves,
     call the mark-read endpoint once with the ids of every loaded message
@@ -1215,3 +1344,314 @@ everyone already has the conversation open — it should flip to "Seen"
 almost immediately (the on-arrival mark-read firing on each recipient's
 client). Reload the page entirely and confirm the "Seen" state persists
 (comes back from `read_by` on the history fetch, not just live state).
+
+---
+
+## Step 12 — Backend: file/image uploads (Phase 2)
+
+Phase 2 scope (from PLAN.md): group chats ✅ → read receipts ✅ → **file/image
+uploads via MinIO** → push notifications. MinIO is an S3-compatible object
+store you run locally via Docker — the whole point is to practice the
+"pre-signed URL" upload pattern real production apps use, not to build your
+own file-serving logic.
+
+> **Design decisions locked in before writing this step:**
+> - **Upload transport: pre-signed URLs, not a backend-proxied upload**
+>   (already the intent in `PLAN.md`). The file's bytes flow straight from
+>   the browser to MinIO over a direct `PUT`; your FastAPI backend never
+>   touches the file content at all, only issues a short-lived signed URL
+>   first and records metadata after. This matters because an async backend
+>   holding a connection open for the full duration of a large upload ties up
+>   a worker for no reason — letting the object store handle the heavy
+>   lifting is the standard scalable pattern (the same idea behind real S3
+>   presigned uploads).
+> - **Client library: `boto3`, not a MinIO-specific SDK.** MinIO speaks the
+>   S3 API, so the standard, most broadly useful (and most interview-relevant)
+>   client works unmodified — just pointed at MinIO's `endpoint_url` instead
+>   of AWS's. `boto3`'s `generate_presigned_url` is pure local HMAC signing,
+>   no network call — safe to call directly inside an `async def` route
+>   without a thread executor, unlike a real upload/download which WOULD
+>   block.
+> - **Bucket creation: on backend startup, not a separate init container.**
+>   MinIO doesn't auto-create buckets. Rather than adding a `minio/mc`
+>   one-shot service to `docker-compose.yml` just to run `mc mb` once,
+>   `init_bucket()` (check-if-exists, create-if-not) is called from the same
+>   `lifespan` in `main.py` that already calls `init_models()` — one
+>   consistent "make sure my dependencies exist" startup pattern instead of
+>   two.
+> - **Known limitation, stated plainly rather than silently skipped:** the
+>   presign endpoint validates the CLAIMED `content_type`/`size_bytes` before
+>   issuing a URL, but the backend never sees the actual uploaded bytes (that
+>   is the entire point of a direct-to-MinIO upload) — so a client that lies
+>   about those values and then uploads something else entirely isn't
+>   caught. A production system would add a post-upload verification step
+>   (e.g. a MinIO bucket-notification webhook). Out of scope for this
+>   practice project; noted here so it's a known, deliberate gap rather than
+>   an overlooked one.
+> - **Pin an explicit MinIO image tag in `docker-compose.yml`, never
+>   `:latest`.** Same lesson already learned the hard way with Postgres back
+>   in Step 1 — an untagged image can silently jump versions on a routine
+>   `docker compose pull` and break compatibility with whatever's already in
+>   the `minio_data` volume.
+
+**Create/modify:**
+```
+docker-compose.yml          (modify — new minio service)
+.env                         (modify — MinIO credentials/bucket name)
+backend/requirements.txt     (modify — add boto3)
+backend/app/
+├── core/
+│   ├── config.py            (modify — MinIO settings)
+│   └── storage.py           (new — boto3 client + init_bucket())
+├── models/
+│   └── attachment.py        (new)
+├── db/
+│   └── base.py              (modify — import attachment)
+├── schemas/
+│   ├── attachment.py        (new)
+│   └── message.py           (modify — MessageResponse gains `attachment`)
+├── api/
+│   ├── routes/
+│   │   ├── uploads.py       (new — presign endpoint)
+│   │   └── conversations.py (modify — embed attachment + fresh download URL
+│   │                          on history fetch, same batching pattern as
+│   │                          Step 10's read_by)
+│   └── ws/
+│       └── chat.py          (modify — accept an attachment on message send,
+│                              embed a fresh download URL in the relay/echo)
+└── main.py                  (modify — call init_bucket() in lifespan)
+```
+
+**`docker-compose.yml`** (modify)
+Plain-English flow:
+- New `minio` service: an explicitly pinned `minio/minio` image tag, a
+  command of `server /data --console-address ":9001"` (the `--console-address`
+  flag is what exposes MinIO's web UI — genuinely useful here for visually
+  confirming uploads landed, independent of your own app).
+- Two ports: `9000` (the actual S3-compatible API your backend/browser talk
+  to) and `9001` (the web console, for poking around manually).
+- A named volume (`minio_data:/data`) so uploaded files survive a restart,
+  same reasoning as `postgres_data`.
+- `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` env vars sourced from `.env`,
+  same `${VAR}` interpolation pattern already used for Postgres.
+- `backend-chat-app` gets `minio` added to its `depends_on` list.
+
+**`.env`** (modify)
+Plain-English flow:
+- Add `MINIO_ROOT_USER`, `MINIO_ROOT_PASSWORD` (the service's own admin
+  credentials — this practice project uses them directly as the backend's
+  access/secret key too, rather than provisioning a separate scoped MinIO
+  user, which would be the real production move), and `MINIO_BUCKET_NAME`
+  (e.g. `chat-uploads`).
+
+**`backend/app/core/config.py`** (modify)
+Plain-English flow:
+- Add `minio_endpoint_url` (e.g. `http://minio-chat-app:9000` — the Docker
+  service name, same reasoning as `DATABASE_URL` pointing at
+  `postgres-chat-app`), `minio_access_key`, `minio_secret_key`,
+  `minio_bucket_name` fields to `Settings`.
+
+**`backend/app/core/storage.py`** (new)
+Why: same reasoning as `db/session.py` and `core/redis.py` — one shared
+client, created once, imported everywhere that needs object storage,
+instead of every route constructing its own.
+Plain-English steps:
+1. `s3_client = boto3.client("s3", endpoint_url=settings.minio_endpoint_url, aws_access_key_id=settings.minio_access_key, aws_secret_access_key=settings.minio_secret_key, region_name="us-east-1")`
+   — the region is meaningless to MinIO but `boto3` requires some value.
+2. `async def init_bucket()`: call `s3_client.head_bucket(Bucket=settings.minio_bucket_name)` inside a try/except — if it raises (bucket doesn't exist), call `s3_client.create_bucket(Bucket=...)`. Even though these are sync `boto3` calls sitting inside an `async def`, that's fine here: this only runs once at startup, not per-request, so a brief blocking call doesn't contend with live traffic the way it would inside a request handler.
+3. A small `def presigned_put_url(object_key, content_type) -> str` and
+   `def presigned_get_url(object_key) -> str` helper pair, both wrapping
+   `s3_client.generate_presigned_url(...)` — centralizing the `ExpiresIn`
+   values (short for uploads, e.g. 300s; longer for downloads, e.g. 3600s)
+   in one place instead of scattering magic numbers across routes.
+
+**`backend/app/models/attachment.py`** (new)
+Why: a message that carries a file needs somewhere to record WHAT file —
+same reasoning as `MessageRead` in Step 10, a genuinely new table since
+nothing existing can hold this.
+Plain-English steps:
+- `class Attachment(Base):` `__tablename__ = "attachments"`:
+  - `id`, `message_id` (`ForeignKey("messages.id")`), `object_key: str`
+    (the MinIO/S3 object key — deliberately NOT a full URL, since a
+    presigned URL expires and gets regenerated fresh on every read; storing
+    one would just go stale), `original_filename: str`, `mime_type: str`,
+    `size_bytes: int`, `created_at`.
+- Brand new table → `create_all()` handles it on next startup, no manual
+  `ALTER TABLE` needed (same as `message_reads` in Step 10).
+
+**`backend/app/db/base.py`** (modify)
+- Add `attachment` to the bottom-of-file import line, same reasoning as
+  every other model.
+
+**`backend/app/schemas/attachment.py`** (new)
+Plain-English steps:
+- `PresignUploadRequest(BaseModel)`: `filename: str`, `content_type: str`,
+  `size_bytes: int`.
+- `PresignUploadResponse(BaseModel)`: `upload_url: str`, `object_key: str`.
+- `AttachmentResponse(BaseModel)`: `id: int`, `download_url: str`,
+  `original_filename: str`, `mime_type: str`, `size_bytes: int`.
+
+**`backend/app/schemas/message.py`** (modify)
+- Add `attachment: AttachmentResponse | None = None` to `MessageResponse` —
+  same "computed, not a real column" reasoning as `read_by` in Step 10.
+
+**`backend/app/api/routes/uploads.py`** (new)
+Why: requesting permission to upload is its own request/response action,
+separate from the WebSocket's job of relaying chat events — matches how
+`conversations.py` already separates plain HTTP actions (create, history)
+from the WebSocket's live-relay job.
+Plain-English steps for `POST /conversations/{conversation_id}/uploads/presign`
+(body: `PresignUploadRequest`, behind `get_current_user`):
+1. Authorization — current user must be a `Participant` of
+   `conversation_id`, identical pattern to every other route touching a
+   conversation. Never trust that being logged in alone means you can
+   upload into any conversation.
+2. Validate the CLAIMED `content_type` against an allow-list (e.g. common
+   image types plus a couple of document types) and `size_bytes` against a
+   cap (e.g. 10 MB) — reject with 400 before issuing a URL if either fails.
+   Remember the limitation noted above: this only rejects obviously-wrong
+   requests up front, it can't verify what actually gets uploaded after.
+3. Build a unique object key:
+   `f"conversations/{conversation_id}/{uuid4()}-{payload.filename}"` —
+   namespaced by conversation (useful for browsing the MinIO console), a
+   UUID prefix so two people uploading a same-named file never collide or
+   silently overwrite each other.
+4. `presigned_put_url(object_key, payload.content_type)` from
+   `storage.py`, return `PresignUploadResponse(upload_url=..., object_key=object_key)`.
+
+**`backend/app/api/ws/chat.py`** (modify)
+Why: sending a file message is still "a message in this conversation" —
+reuses the exact same create-relay-echo flow Step 11 just built for text,
+just with an optional attachment attached to it.
+Plain-English steps:
+1. Incoming WS payload for a file message:
+   `{"type": "image" | "file", "object_key": "...", "original_filename": "...", "mime_type": "...", "size_bytes": ..., "content": "optional caption"}`.
+2. After creating and committing the `Message` row (`type` taken from
+   `data.get("type", "text")`, `content` can be empty/caption), if
+   `data.get("object_key")` is present: create an
+   `Attachment(message_id=message.id, object_key=..., original_filename=..., mime_type=..., size_bytes=...)`,
+   `db.add`, `await db.commit()`.
+3. When building the relay payload, if the message has an attachment,
+   generate a FRESH `presigned_get_url(object_key)` and embed it as
+   `attachment: {id, download_url, original_filename, mime_type, size_bytes}`
+   — never store or reuse a previously-generated URL, since it may have
+   expired.
+4. Everything else — relay to every other participant, THEN echo back to
+   the sender's own socket (Step 11's fix) — is unchanged; a file message
+   fans out and self-reconciles exactly like a text message.
+
+**`backend/app/api/routes/conversations.py`** (modify)
+Why: history needs to show past attachments too, with a freshly-generated
+(not stale) download URL, same spirit as Step 10's `read_by` batching.
+Plain-English steps:
+- After fetching the page of `Message` rows, batch-fetch `Attachment` rows
+  for those message ids in ONE query (`Attachment.message_id.in_([...])`)
+  — same N+1-avoidance reasoning as `read_by`.
+- For every message that has a matching `Attachment`, generate a fresh
+  `presigned_get_url(object_key)` and attach it when building that
+  message's `MessageResponse`.
+
+**`backend/app/main.py`** (modify)
+- Import `init_bucket` from `app.core.storage`, call `await init_bucket()`
+  in the `lifespan` alongside the existing `await init_models()`.
+
+**Checkpoint**: `docker compose up --build` brings up a `minio` container
+too; its web console (`http://localhost:9001`, logged in with
+`MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD`) shows an empty `chat-uploads`
+bucket after the backend's first startup (confirms `init_bucket()` ran).
+Call the presign endpoint for a real conversation with a valid image
+content-type/size, `PUT` a real file to the returned `upload_url` with
+`curl` or a script, confirm the file appears in the MinIO console. Send a
+WS message referencing that `object_key`, confirm a `messages` row AND an
+`attachments` row both exist in Postgres, and the relayed/echoed payload
+contains a working `download_url` you can open directly in a browser.
+Re-fetch conversation history and confirm the attachment still has a valid
+(freshly-generated) `download_url`, not the original one.
+
+---
+
+## Step 13 — Frontend: file/image uploads (Phase 2)
+
+**Modify/create inside `frontend/`:**
+```
+types/index.ts
+lib/uploads.ts                            (new)
+lib/websocket.ts
+components/MessageInput.tsx
+components/MessageList.tsx
+app/chat/[conversationId]/page.tsx
+```
+
+**`types/index.ts`**
+Plain-English flow:
+- Add `Attachment` interface mirroring `AttachmentResponse`: `id`,
+  `download_url`, `original_filename`, `mime_type`, `size_bytes`.
+- `Message` gains `attachment?: Attachment | null`.
+
+**`lib/uploads.ts`** (new)
+Why: the upload flow is a multi-step dance (ask backend for permission,
+then talk to MinIO directly) that doesn't belong inlined in a component.
+Plain-English steps:
+1. `async function uploadFile(conversationId, file): Promise<{object_key, original_filename, mime_type, size_bytes}>`.
+2. Call the presign endpoint via the existing `apiJson` helper:
+   `POST /conversations/${conversationId}/uploads/presign` with
+   `{filename: file.name, content_type: file.type, size_bytes: file.size}`.
+3. `fetch(upload_url, { method: "PUT", body: file, headers: { "Content-Type": file.type } })`
+   — a RAW `fetch`, deliberately NOT `apiJson`/`apiFetch`: this request goes
+   to MinIO, not your backend, and must NOT carry your app's
+   `Authorization` bearer token — the presigned URL itself IS the auth, and
+   an unexpected extra header could even invalidate MinIO's signature
+   check.
+4. Return the metadata the caller needs to send over the WebSocket next —
+   this function's job ends once the bytes are safely in MinIO.
+
+**`components/MessageInput.tsx`** (modify)
+Plain-English flow:
+- Add a hidden `<input type="file">` behind a visible button/icon.
+- On file selection: disable the input (prevent double-submission while
+  uploading), call `uploadFile(conversationId, file)`, then call a new
+  `onSendFile` prop with the returned metadata plus a `type` of `"image"`
+  if `mime_type.startsWith("image/")`, else `"file"`. Re-enable the input
+  once done (success or failure) — show an error inline on failure (e.g.
+  the presign request was rejected for size/type) rather than silently
+  swallowing it.
+
+**`lib/websocket.ts`** (modify)
+- Add a `sendFileMessage(payload)` alongside the existing `sendMessage`,
+  sending the richer `{type, object_key, original_filename, mime_type, size_bytes, content}`
+  shape over the same socket — `sendMessage` stays untouched for plain text.
+
+**`app/chat/[conversationId]/page.tsx`** (modify)
+Plain-English flow:
+- `onSendFile` handler mirrors `handleSend` exactly: add an optimistic
+  placeholder message immediately (so the UI doesn't wait on the network),
+  push its id onto the SAME `pendingSentIdsRef` queue Step 11 already
+  built, call `sendFileMessage(...)`. When the self-echo arrives via
+  `onMessage` (already reconciling by shifting the oldest pending id), the
+  placeholder gets swapped for the confirmed message — attachment,
+  real id, and real `download_url` all included for free, no new
+  reconciliation logic needed.
+
+**`components/MessageList.tsx`** (modify)
+Plain-English flow:
+- When a message has `attachment`:
+  - If `mime_type` starts with `image/`: render
+    `<img src={attachment.download_url} />` inside the bubble (capped
+    `max-width`/`max-height`, matching the existing bubble's `max-w-xs`).
+  - Otherwise: render a small file icon plus `attachment.original_filename`
+    as a clickable `<a href={attachment.download_url} download>` link.
+- A message can still have `content` as a caption alongside the attachment
+  — render both (image/link first, caption text below or above it) rather
+  than treating them as mutually exclusive.
+
+**Checkpoint**: pick an image in a 1-to-1 or group chat — see a brief
+"uploading" state, then the image renders inline for the sender (via the
+self-echo/reconciliation path) and live for every other open participant
+(via the relay). Reload the page and confirm the image still renders (a
+freshly-generated `download_url` from the history endpoint, not a stale
+cached one — if this breaks, the presigned URL probably expired before the
+reload, which would actually indicate the history endpoint isn't
+regenerating it fresh as designed). Send a non-image file (e.g. a PDF) and
+confirm it renders as a download link, not a broken image tag. Try a file
+over the size cap or an unsupported type and confirm the upload is rejected
+with a visible error before anything reaches MinIO.
