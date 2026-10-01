@@ -8,6 +8,7 @@ interface MessageListProps {
   currentUserId: number;
   isGroup: boolean;
   participantsById: Record<number, string>;
+  otherParticipantIds: number[];
   typingLabel: string | null;
   onLoadOlder: () => void;
   hasMore: boolean;
@@ -18,6 +19,7 @@ export function MessageList({
   currentUserId,
   isGroup,
   participantsById,
+  otherParticipantIds,
   typingLabel,
   onLoadOlder,
   hasMore,
@@ -41,6 +43,15 @@ export function MessageList({
       <div className="flex flex-col gap-2">
         {messages.map((message) => {
           const isMine = message.sender_id === currentUserId;
+          // "Seen" only ever applies to your own messages, and only once
+          // EVERY other participant has read it — otherParticipantIds is
+          // empty for a degenerate conversation with nobody else in it, and
+          // `.every()` on an empty array is vacuously true, so that case is
+          // guarded explicitly rather than showing "Seen" on everything.
+          const seenByEveryone =
+            isMine &&
+            otherParticipantIds.length > 0 &&
+            otherParticipantIds.every((id) => message.read_by.includes(id));
           return (
             <div key={message.id} className={`flex flex-col ${isMine ? "items-end" : "items-start"}`}>
               {isGroup && !isMine && (
@@ -55,6 +66,7 @@ export function MessageList({
               >
                 {message.content}
               </div>
+              {seenByEveryone && <span className="mt-0.5 px-1 text-xs italic text-zinc-500">Seen</span>}
             </div>
           );
         })}

@@ -138,9 +138,18 @@ just redirects to `/login`.
   per 2s, and the receiving side auto-hides its "Typing…" indicator after ~3s of silence rather
   than waiting for an explicit "stopped typing" event — mirrors the backend presence TTL's
   self-healing approach.
-- **The backend never echoes a sent message back to its own sender** (`chat.py` only relays to
-  the *other* participant) — so `app/chat/[conversationId]/page.tsx`'s `handleSend` appends the
-  outgoing message to local state itself rather than waiting on the socket.
+- **The backend echoes a sent message back to its own sender, in addition to relaying it to
+  every other participant** (`chat.py`, added in Step 10/11 for read receipts). This reverses an
+  earlier design (Phase 1 never echoed to the sender) — `app/chat/[conversationId]/page.tsx`'s
+  `handleSend` still shows the outgoing message optimistically under a fake local id for instant
+  feedback, but a real echo is now required: read receipts arrive as `{"type": "read",
+  "message_ids": [...]}` events carrying the REAL database id, and a sender whose own message is
+  still sitting under a fake id can never match against it, so "Seen" could never appear on your
+  own messages. The frontend reconciles this via a FIFO queue (`pendingSentIdsRef`) of
+  not-yet-confirmed placeholder ids — safe to match strictly in send order since a single
+  WebSocket connection persists/echoes messages in the order they were sent. `onMessage` checks
+  `message.sender_id === currentUserId`: if true, it's a self-echo, so the oldest pending
+  placeholder is swapped for the confirmed message instead of being appended as a duplicate.
 - **Reading `localStorage` during render breaks hydration.** The conversation page needs the
   current user id to render, but `getCurrentUserId()` is a browser-only read — computing it
   inline mismatches SSR (always `null`) against the client's first render (a real id). Fixed

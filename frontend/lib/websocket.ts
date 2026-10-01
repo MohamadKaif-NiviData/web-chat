@@ -3,13 +3,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { WS_BASE_URL } from "./config";
 import { getAccessToken } from "./auth";
-import type { Message, TypingEvent } from "@/types";
+import type { Message, ReadEvent, TypingEvent } from "@/types";
 
 const TYPING_THROTTLE_MS = 2000;
 
 interface ChatSocketHandlers {
   onMessage: (message: Message) => void;
   onTyping: (userId: number) => void;
+  onRead: (messageIds: number[], userId: number) => void;
 }
 
 export function useChatSocket(conversationId: number | null, handlers: ChatSocketHandlers) {
@@ -33,9 +34,12 @@ export function useChatSocket(conversationId: number | null, handlers: ChatSocke
     socket.onopen = () => setConnected(true);
     socket.onclose = () => setConnected(false);
     socket.onmessage = (event) => {
-      const data = JSON.parse(event.data) as Message | TypingEvent;
+      const data = JSON.parse(event.data) as Message | TypingEvent | ReadEvent;
       if (data.type === "typing") {
         handlersRef.current.onTyping((data as TypingEvent).user_id);
+      } else if (data.type === "read") {
+        const readEvent = data as ReadEvent;
+        handlersRef.current.onRead(readEvent.message_ids, readEvent.user_id);
       } else {
         handlersRef.current.onMessage(data as Message);
       }

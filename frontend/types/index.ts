@@ -11,6 +11,7 @@ export interface Message {
   content: string;
   type: string;
   created_at: string;
+  read_by: number[];
 }
 
 export interface MessagePage {
@@ -45,5 +46,11 @@ export interface TokenPair {
 
 export type TypingEvent = {
   type: "typing";
+  user_id: number;
+};
+
+export type ReadEvent = {
+  type: "read";
+  message_ids: number[];
   user_id: number;
 };

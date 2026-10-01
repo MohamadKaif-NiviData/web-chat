@@ -105,6 +105,17 @@ async def chat_endpoint(
             payload = MessageResponse.model_validate(message).model_dump(mode="json")
             for uid in other_user_ids:
                 await manager.send_to_user(uid, payload)
+
+            # Echo the persisted message back to the SENDER's own socket too.
+            # Read receipts need this: the frontend optimistically shows your
+            # own outgoing message under a fake local id (it never waited on
+            # the socket before), but a "read" event later arrives carrying
+            # the REAL database id — with no echo, the sender's copy never
+            # learns that real id and can never match against it, so "Seen"
+            # could never appear on your own messages. The frontend reconciles
+            # this echo against its optimistic placeholder (see handleSend /
+            # onMessage in app/chat/[conversationId]/page.tsx).
+            await manager.send_to_user(user_id, payload)
     except WebSocketDisconnect:
         pass
 

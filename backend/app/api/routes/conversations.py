@@ -1,3 +1,4 @@
+from collections import defaultdict
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Depends, Query
@@ -8,9 +9,11 @@ from app.api.deps import get_current_user
 from app.models.user import User
 from app.models.conversation import Conversation, Participant
 from app.models.message import Message
-from app.schemas.message import MessageResponse, MessagePage
+from app.models.message_read import MessageRead
+from app.schemas.message import MessageResponse, MessagePage, MarkReadRequest
 from app.schemas.conversation import ConversationResponse, ConversationSummary, ParticipantSummary, GroupCreateRequest
 from app.services.presence import is_online
+from app.services.connection_manager import manager
 
 router = APIRouter()
 
@@ -202,7 +205,30 @@ async def get_message_history(conversation_id: int, cursor: int | None = Query(N
         next_cursor = messages[limit - 1].id
         messages = messages[:limit]
 
-    return MessagePage(messages=messages, next_cursor=next_cursor)
+    # Batch-fetch read state for this page — one query for all messages,
+    # not one per message (same N+1 trap avoided everywhere else here).
+    read_result = await db.execute(
+        select(MessageRead.message_id, MessageRead.user_id)
+        .where(MessageRead.message_id.in_([m.id for m in messages]))
+    )
+    read_by_map: dict[int, list[int]] = defaultdict(list)
+    for message_id, user_id in read_result.all():
+        read_by_map[message_id].append(user_id)
+
+    message_responses = [
+        MessageResponse(
+            id=m.id,
+            conversation_id=m.conversation_id,
+            sender_id=m.sender_id,
+            content=m.content,
+            type=m.type,
+            created_at=m.created_at,
+            read_by=read_by_map.get(m.id, []),
+        )
+        for m in messages
+    ]
+
+    return MessagePage(messages=message_responses, next_cursor=next_cursor)
 
 
 # Why: the frontend's conversation page only knows the conversation_id from
@@ -273,3 +299,69 @@ async def get_conversation(conversation_id: int, current_user: User = Depends(ge
         ) for user in other_users],
         last_message=MessageResponse.model_validate(last_message) if last_message else None,
     )
+
+
+@router.post("/{conversation_id}/messages/read")
+async def mark_messages_read(
+    conversation_id: int,
+    payload: MarkReadRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    # Authorization check
+    result = await db.execute(
+        select(Participant)
+        .where(Participant.conversation_id == conversation_id)
+        .where(Participant.user_id == current_user.id)
+    )
+    participant = result.scalar_one_or_none()
+    if not participant:
+        raise HTTPException(status_code=403, detail="Not authorized to mark messages in this conversation")
+
+    # Never trust the requested message_ids at face value: keep only ids that
+    # actually belong to this conversation and weren't sent by the current
+    # user (marking your own message "read by you" is meaningless).
+    valid_result = await db.execute(
+        select(Message.id).where(
+            Message.conversation_id == conversation_id,
+            Message.sender_id != current_user.id,
+            Message.id.in_(payload.message_ids),
+        )
+    )
+    valid_ids = [row[0] for row in valid_result.all()]
+    if not valid_ids:
+        return {"marked": []}
+
+    already_read_result = await db.execute(
+        select(MessageRead.message_id).where(
+            MessageRead.user_id == current_user.id,
+            MessageRead.message_id.in_(valid_ids),
+        )
+    )
+    already_read = {row[0] for row in already_read_result.all()}
+
+    newly_read_ids = [mid for mid in valid_ids if mid not in already_read]
+    if not newly_read_ids:
+        return {"marked": []}
+
+    db.add_all(
+        [MessageRead(message_id=mid, user_id=current_user.id) for mid in newly_read_ids]
+    )
+    await db.commit()
+
+    # Broadcast once per participant, carrying the whole batch of newly-read
+    # ids in a single event — not one event per message.
+    other_result = await db.execute(
+        select(Participant.user_id).where(
+            Participant.conversation_id == conversation_id,
+            Participant.user_id != current_user.id,
+        )
+    )
+    other_user_ids = [row[0] for row in other_result.all()]
+    for uid in other_user_ids:
+        await manager.send_to_user(
+            uid,
+            {"type": "read", "message_ids": newly_read_ids, "user_id": current_user.id},
+        )
+
+    return {"marked": newly_read_ids}
