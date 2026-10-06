@@ -1,6 +1,7 @@
 from collections import defaultdict
 from datetime import datetime, timezone
 
+from app.models.attachment import Attachment
 from fastapi import APIRouter, HTTPException, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -12,6 +13,8 @@ from app.models.message import Message
 from app.models.message_read import MessageRead
 from app.schemas.message import MessageResponse, MessagePage, MarkReadRequest
 from app.schemas.conversation import ConversationResponse, ConversationSummary, ParticipantSummary, GroupCreateRequest
+from app.schemas.attachment import AttachmentResponse
+from app.core.config import presigned_get_url, settings
 from app.services.presence import is_online
 from app.services.connection_manager import manager
 
@@ -215,6 +218,28 @@ async def get_message_history(conversation_id: int, cursor: int | None = Query(N
     for message_id, user_id in read_result.all():
         read_by_map[message_id].append(user_id)
 
+    attachment_result = await db.execute(
+        select(Attachment)
+        .where(Attachment.message_id.in_([m.id for m in messages]))
+    )
+    attachment_by_message: dict[int, Attachment] = {
+        a.message_id: a for a in attachment_result.scalars().all()
+    }
+
+    def build_attachment(m: Message) -> AttachmentResponse | None:
+        a = attachment_by_message.get(m.id)
+        if a is None:
+            return None
+        # Regenerated fresh on every read — never stored/reused, since
+        # presigned URLs expire (see GUIDE.md Step 12).
+        return AttachmentResponse(
+            id=a.id,
+            download_url=presigned_get_url(settings.s3_bucket_name, a.object_key),
+            original_filename=a.original_filename,
+            mime_type=a.mime_type,
+            size_bytes=a.size_bytes,
+        )
+
     message_responses = [
         MessageResponse(
             id=m.id,
@@ -224,6 +249,7 @@ async def get_message_history(conversation_id: int, cursor: int | None = Query(N
             type=m.type,
             created_at=m.created_at,
             read_by=read_by_map.get(m.id, []),
+            attachment=build_attachment(m),
         )
         for m in messages
     ]

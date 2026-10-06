@@ -4,6 +4,14 @@ export interface User {
   display_name: string;
 }
 
+export interface Attachment {
+  id: number;
+  download_url: string;
+  original_filename: string;
+  mime_type: string;
+  size_bytes: number;
+}
+
 export interface Message {
   id: number;
   conversation_id: number;
@@ -12,6 +20,7 @@ export interface Message {
   type: string;
   created_at: string;
   read_by: number[];
+  attachment?: Attachment | null;
 }
 
 export interface MessagePage {

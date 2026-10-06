@@ -11,6 +11,8 @@ from app.models.message import Message
 from app.schemas.message import MessageResponse
 from app.services.connection_manager import manager
 from app.services.presence import set_online, set_offline
+from app.models.attachment import Attachment
+from app.core.config import presigned_get_url, settings
 
 
 router = APIRouter()
@@ -97,12 +99,35 @@ async def chat_endpoint(
                 conversation_id=conversation_id,
                 sender_id=user_id,
                 content=data["content"],
+                type=data.get("type", "text")
             )
             db.add(message)
             await db.commit()
             await db.refresh(message)
 
+            attachment = None
+            if data.get("object_key"):
+                attachment = Attachment(
+                    message_id=message.id,
+                    object_key=data["object_key"],
+                    original_filename=data["original_filename"],
+                    mime_type=data["mime_type"],
+                    size_bytes=data["size_bytes"],
+                )
+                db.add(attachment)
+                await db.commit()
+                await db.refresh(attachment)
+
             payload = MessageResponse.model_validate(message).model_dump(mode="json")
+            if attachment:
+                payload["attachment"] = {
+                    "id": attachment.id,
+                    "download_url": presigned_get_url(settings.s3_bucket_name, attachment.object_key),
+                    "original_filename": attachment.original_filename,
+                    "mime_type": attachment.mime_type,
+                    "size_bytes": attachment.size_bytes,
+                }
+
             for uid in other_user_ids:
                 await manager.send_to_user(uid, payload)
 

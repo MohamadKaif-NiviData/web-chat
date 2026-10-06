@@ -23,12 +23,19 @@ WebSocket chat with pagination → presence/typing → frontend auth + chat UI.
 | 9 — Frontend: group chats (Phase 2) | ✅ Done |
 | 10 — Backend: read receipts (Phase 2) | ✅ Done |
 | 11 — Frontend: read receipts (Phase 2) | ✅ Done |
-| 12 — Backend: file/image uploads (Phase 2) | ⬜ Not started |
-| 13 — Frontend: file/image uploads (Phase 2) | ⬜ Not started |
+| 12 — Backend: file/image uploads (Phase 2) | ✅ Done |
+| 13 — Frontend: file/image uploads (Phase 2) | ✅ Done |
 
-**Next up: Step 12** — Read receipts are fully done and verified live in the
-browser (two genuinely independent sessions, not same-profile tabs — see the
-gotcha below). File/image uploads via MinIO is next.
+**Next up: push notifications** — the last piece of Phase 2. File/image
+uploads (Steps 12-13) are fully done and verified end-to-end against a real
+AWS S3 bucket: presign → direct browser-to-S3 `PUT` → WebSocket relay/echo
+with a fresh presigned download URL → inline image (with a click-to-expand
+lightbox) or a download link for non-images, confirmed both via live
+WebSocket/API testing and by actually clicking through the running frontend
+in a browser. See the verification callouts inside Steps 12 and 13 below for
+the real bugs hit along the way (an attachment-before-commit ordering bug, a
+missing S3 CORS policy, a couple of bad import paths) and how each was
+diagnosed and fixed.
 
 > **Step 11 verification, and a real bug it surfaced**: confirmed live in
 > the browser with the Chrome extension, using one real session ("N") plus a
@@ -1347,62 +1354,146 @@ client). Reload the page entirely and confirm the "Seen" state persists
 
 ---
 
-## Step 12 — Backend: file/image uploads (Phase 2)
+## Step 12 — Backend: file/image uploads (Phase 2) ✅ Done
 
 Phase 2 scope (from PLAN.md): group chats ✅ → read receipts ✅ → **file/image
-uploads via MinIO** → push notifications. MinIO is an S3-compatible object
-store you run locally via Docker — the whole point is to practice the
-"pre-signed URL" upload pattern real production apps use, not to build your
-own file-serving logic.
+uploads** → push notifications. Originally planned around a local MinIO
+container; switched to a real AWS S3 bucket instead (decided after
+discussion — see below), which changes a few specifics but not the core
+pattern: still a pre-signed-URL upload, still `boto3`.
 
-> **Design decisions locked in before writing this step:**
+> **What actually got built, and where it differs from the plan below:**
+> - `verify_bucket()`, `presigned_put_url()`, and `presigned_get_url()` ended
+>   up living in `core/config.py` alongside `Settings`, not in a separate
+>   `core/storage.py` — functionally identical to the plan, just one file
+>   instead of two. `main.py` imports `verify_bucket` from `app.core.config`,
+>   not `app.core.storage`.
+> - The presign route is `POST /uploads/{conversation_id}/presign`
+>   (registered with `prefix="/uploads"` in `main.py`), not
+>   `POST /conversations/{conversation_id}/uploads/presign` as originally
+>   drafted below — the plan's wording was corrected to match what's actually
+>   wired up and what the frontend calls.
+> - `uploads.py` takes the request as a JSON body (`PresignUploadRequest`),
+>   not query params, so it reuses the schema that already existed instead of
+>   leaving it dead code.
+>
+> **Real bugs hit while building this (useful if you hit the same class of
+> error again):**
+> - `models/attachment.py` first had `from tokenize import String` (a typo —
+>   `tokenize.String` is an unrelated token-type constant) and was missing
+>   `DateTime`/`func` imports entirely — `NameError` the moment the class
+>   body executed. Fixed by importing all four from `sqlalchemy`.
+> - Two wrong import paths crashed app startup with `ModuleNotFoundError`:
+>   `conversations.py` had `from backend.app.models.attachment import
+>   Attachment` (should be `app.models.attachment`, no `backend.` prefix —
+>   every other import in that same file already gets this right), and
+>   `uploads.py` imported `PresignUploadResponse` from a `app.schemas.uploads`
+>   module that never existed (the real file is `app.schemas.attachment`).
+> - `db/base.py`'s bottom-of-file import line imported the `Attachment`
+>   *class* instead of the `attachment` *module* — `app/models/__init__.py`
+>   is empty, so nothing re-exports the class at package level, and this
+>   raised `ImportError`. Fixed to match the module-import pattern every
+>   other model in that line already uses.
+> - `Settings` was missing all four AWS fields even though the module-level
+>   `s3_client = boto3.client(...)` line right below referenced
+>   `settings.aws_access_key_id` etc. — `AttributeError` at import time.
+> - The real ordering bug, and the subtlest one: `Attachment(message_id=
+>   message.id, ...)` was originally being built *before* `db.add(message)` /
+>   `await db.commit()` / `await db.refresh(message)` — at that point
+>   `message.id` is still `None` (SQLAlchemy only assigns a primary key once
+>   a row is actually flushed to Postgres), so every attachment was silently
+>   saved with `message_id = NULL`. Fixed by creating the message, committing
+>   it, refreshing it, and only THEN building the `Attachment` off its now-real
+>   `message.id`.
+> - `uploads.py` initially had no `get_current_user`/participant check at all
+>   (anyone could request an upload URL into ANY conversation) and no
+>   content-type/size validation — closed by adding the 403 participant
+>   check, a content-type allow-list + 10MB cap (400 on either), and a
+>   `uuid4()` prefix on `object_key` so two same-named uploads in one
+>   conversation can't silently overwrite each other in S3.
+> - `verify_bucket()` originally swallowed every exception and returned
+>   `False` instead of raising, and `main.py` wasn't even calling it from
+>   `lifespan` — a broken bucket/credentials config would have failed
+>   silently instead of refusing to start, exactly the failure mode the
+>   design notes below explicitly want to avoid.
+>
+> **Verification**: tested against a real AWS S3 bucket, not mocks — signed
+> up two real users, created a real conversation, then: a non-participant's
+> presign request → 403; a disallowed content-type → 400; an oversized
+> `size_bytes` → 400; a valid request → got back a real `upload_url` +
+> `object_key`; a real `curl -T` PUT of an actual PNG straight to that URL →
+> 200, confirmed in the S3 console; a WebSocket message referencing that
+> `object_key` → an `attachments` row in Postgres with the CORRECT
+> `message_id` (confirming the ordering-bug fix), and both the relay (to the
+> other participant) and the self-echo carried a working, openable
+> `download_url`; re-fetching conversation history returned the SAME
+> attachment with a DIFFERENT signature/timestamp in its `download_url` than
+> the WebSocket event had — proof it's regenerated fresh on every read, never
+> cached or stored; downloading through that URL produced bytes byte-for-byte
+> identical to the original upload. Backend logs stayed clean throughout, no
+> tracebacks.
+
+> **Design decisions locked in before writing this step** (discussed and
+> confirmed, including two changes from an earlier draft of this plan):
+> - **Real AWS S3, not local MinIO.** `boto3` talks to both identically — no
+>   backend code differs based on which one you point it at — so this is
+>   purely a config choice, not an architecture one. Trade-off worth being
+>   deliberate about: real S3 needs real credentials in `.env` (never
+>   committed — use an IAM user scoped to ONLY this one bucket, never your
+>   AWS root/admin keys) and requires actual internet access even for local
+>   dev, whereas MinIO was fully offline and free. Since the AWS account
+>   already exists, this is a reasonable trade to make.
 > - **Upload transport: pre-signed URLs, not a backend-proxied upload**
->   (already the intent in `PLAN.md`). The file's bytes flow straight from
->   the browser to MinIO over a direct `PUT`; your FastAPI backend never
->   touches the file content at all, only issues a short-lived signed URL
->   first and records metadata after. This matters because an async backend
->   holding a connection open for the full duration of a large upload ties up
->   a worker for no reason — letting the object store handle the heavy
->   lifting is the standard scalable pattern (the same idea behind real S3
->   presigned uploads).
-> - **Client library: `boto3`, not a MinIO-specific SDK.** MinIO speaks the
->   S3 API, so the standard, most broadly useful (and most interview-relevant)
->   client works unmodified — just pointed at MinIO's `endpoint_url` instead
->   of AWS's. `boto3`'s `generate_presigned_url` is pure local HMAC signing,
->   no network call — safe to call directly inside an `async def` route
->   without a thread executor, unlike a real upload/download which WOULD
->   block.
-> - **Bucket creation: on backend startup, not a separate init container.**
->   MinIO doesn't auto-create buckets. Rather than adding a `minio/mc`
->   one-shot service to `docker-compose.yml` just to run `mc mb` once,
->   `init_bucket()` (check-if-exists, create-if-not) is called from the same
->   `lifespan` in `main.py` that already calls `init_models()` — one
->   consistent "make sure my dependencies exist" startup pattern instead of
->   two.
+>   (already the intent in `PLAN.md`, confirmed again in discussion). The
+>   file's bytes flow straight from the browser to S3 over a direct `PUT`;
+>   your FastAPI backend never touches the file content at all, only issues
+>   a short-lived signed URL first and records metadata after. This matters
+>   because an async backend holding a connection open for the full duration
+>   of a large upload ties up a worker for no reason — letting the object
+>   store handle the heavy lifting is the standard scalable pattern.
+> - **This ordering choice also fixes a real bug in an earlier version of
+>   this plan.** The first draft was "create the DB row, then upload to S3"
+>   — if the upload failed afterward (network blip, crash), you'd be left
+>   with a message in the chat claiming to have an image that was never
+>   actually stored: a permanently broken bubble for everyone in that
+>   conversation, with no clean retry path. The pre-signed flow makes this
+>   impossible by construction: the browser's `PUT` to S3 completes (or
+>   fails) BEFORE the browser ever tells the backend "attach this to a
+>   message" — the DB row only gets created once the upload is already a
+>   known-good fact.
+> - **Client library: `boto3`.** The standard, most broadly useful (and most
+>   interview-relevant) S3 client. `generate_presigned_url` is pure local
+>   HMAC signing, no network call — safe to call directly inside an
+>   `async def` route without a thread executor, unlike a real upload/
+>   download which WOULD block.
+> - **Bucket creation: manual, one-time, NOT automatic on backend startup.**
+>   This is the one place real AWS genuinely differs from the MinIO plan,
+>   and deliberately so: an S3 bucket name is globally unique across ALL of
+>   AWS (not just your account) and has real billing/lifecycle implications
+>   — auto-creating it from app startup code (fine for throwaway local MinIO
+>   infra you recreate constantly) is the wrong instinct for a real cloud
+>   resource. Create the bucket once yourself via the AWS Console or CLI;
+>   the backend only ever verifies it exists (`head_bucket`) at startup and
+>   fails loudly with a clear error if it doesn't, rather than trying to
+>   create one.
 > - **Known limitation, stated plainly rather than silently skipped:** the
 >   presign endpoint validates the CLAIMED `content_type`/`size_bytes` before
 >   issuing a URL, but the backend never sees the actual uploaded bytes (that
->   is the entire point of a direct-to-MinIO upload) — so a client that lies
+>   is the entire point of a direct-to-S3 upload) — so a client that lies
 >   about those values and then uploads something else entirely isn't
 >   caught. A production system would add a post-upload verification step
->   (e.g. a MinIO bucket-notification webhook). Out of scope for this
->   practice project; noted here so it's a known, deliberate gap rather than
->   an overlooked one.
-> - **Pin an explicit MinIO image tag in `docker-compose.yml`, never
->   `:latest`.** Same lesson already learned the hard way with Postgres back
->   in Step 1 — an untagged image can silently jump versions on a routine
->   `docker compose pull` and break compatibility with whatever's already in
->   the `minio_data` volume.
+>   (e.g. an S3 event notification triggering a Lambda/webhook). Out of
+>   scope for this practice project; noted here so it's a known, deliberate
+>   gap rather than an overlooked one.
 
 **Create/modify:**
 ```
-docker-compose.yml          (modify — new minio service)
-.env                         (modify — MinIO credentials/bucket name)
+.env                         (modify — AWS credentials/bucket name)
 backend/requirements.txt     (modify — add boto3)
 backend/app/
 ├── core/
-│   ├── config.py            (modify — MinIO settings)
-│   └── storage.py           (new — boto3 client + init_bucket())
+│   ├── config.py            (modify — AWS/S3 settings)
+│   └── storage.py           (new — boto3 client + verify_bucket())
 ├── models/
 │   └── attachment.py        (new)
 ├── db/
@@ -1419,46 +1510,45 @@ backend/app/
 │   └── ws/
 │       └── chat.py          (modify — accept an attachment on message send,
 │                              embed a fresh download URL in the relay/echo)
-└── main.py                  (modify — call init_bucket() in lifespan)
+└── main.py                  (modify — call verify_bucket() in lifespan)
 ```
 
-**`docker-compose.yml`** (modify)
-Plain-English flow:
-- New `minio` service: an explicitly pinned `minio/minio` image tag, a
-  command of `server /data --console-address ":9001"` (the `--console-address`
-  flag is what exposes MinIO's web UI — genuinely useful here for visually
-  confirming uploads landed, independent of your own app).
-- Two ports: `9000` (the actual S3-compatible API your backend/browser talk
-  to) and `9001` (the web console, for poking around manually).
-- A named volume (`minio_data:/data`) so uploaded files survive a restart,
-  same reasoning as `postgres_data`.
-- `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` env vars sourced from `.env`,
-  same `${VAR}` interpolation pattern already used for Postgres.
-- `backend-chat-app` gets `minio` added to its `depends_on` list.
+**One-time manual setup (not code — do this yourself before running the
+backend):**
+1. In the AWS Console, create an S3 bucket (e.g. `your-name-chat-uploads` —
+   remember bucket names are globally unique, so a generic name like
+   `chat-uploads` is almost certainly already taken by someone else).
+   Leave "Block all public access" ON — nothing here should be publicly
+   readable; access only ever happens through short-lived pre-signed URLs.
+2. Create an IAM user (or role) with a policy scoped to ONLY that bucket —
+   `s3:PutObject`, `s3:GetObject`, `s3:HeadBucket` on
+   `arn:aws:s3:::your-bucket-name` and `arn:aws:s3:::your-bucket-name/*`.
+   Do not reuse your AWS root account's access keys here.
+3. Generate an access key pair for that IAM user — this is what goes in
+   `.env`, never your root credentials.
 
 **`.env`** (modify)
 Plain-English flow:
-- Add `MINIO_ROOT_USER`, `MINIO_ROOT_PASSWORD` (the service's own admin
-  credentials — this practice project uses them directly as the backend's
-  access/secret key too, rather than provisioning a separate scoped MinIO
-  user, which would be the real production move), and `MINIO_BUCKET_NAME`
-  (e.g. `chat-uploads`).
+- Add `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` (the
+  IAM user's credentials and the bucket's region), and `S3_BUCKET_NAME`.
 
 **`backend/app/core/config.py`** (modify)
 Plain-English flow:
-- Add `minio_endpoint_url` (e.g. `http://minio-chat-app:9000` — the Docker
-  service name, same reasoning as `DATABASE_URL` pointing at
-  `postgres-chat-app`), `minio_access_key`, `minio_secret_key`,
-  `minio_bucket_name` fields to `Settings`.
+- Add `aws_access_key_id`, `aws_secret_access_key`, `aws_region`,
+  `s3_bucket_name` fields to `Settings`.
 
 **`backend/app/core/storage.py`** (new)
 Why: same reasoning as `db/session.py` and `core/redis.py` — one shared
 client, created once, imported everywhere that needs object storage,
 instead of every route constructing its own.
 Plain-English steps:
-1. `s3_client = boto3.client("s3", endpoint_url=settings.minio_endpoint_url, aws_access_key_id=settings.minio_access_key, aws_secret_access_key=settings.minio_secret_key, region_name="us-east-1")`
-   — the region is meaningless to MinIO but `boto3` requires some value.
-2. `async def init_bucket()`: call `s3_client.head_bucket(Bucket=settings.minio_bucket_name)` inside a try/except — if it raises (bucket doesn't exist), call `s3_client.create_bucket(Bucket=...)`. Even though these are sync `boto3` calls sitting inside an `async def`, that's fine here: this only runs once at startup, not per-request, so a brief blocking call doesn't contend with live traffic the way it would inside a request handler.
+1. `s3_client = boto3.client("s3", region_name=settings.aws_region, aws_access_key_id=settings.aws_access_key_id, aws_secret_access_key=settings.aws_secret_access_key)`
+   — no `endpoint_url` override needed; omitting it means `boto3` talks to
+   real AWS by default. (Worth knowing for later: adding an `endpoint_url`
+   back in is the ONLY change that would be needed to point this same code
+   at a local MinIO instead — e.g. for running tests without touching real
+   AWS.)
+2. `async def verify_bucket()`: call `s3_client.head_bucket(Bucket=settings.s3_bucket_name)` — if it raises, raise a clear startup error ("bucket X doesn't exist or these credentials can't see it — create it manually first") rather than attempting to create one. Even though this is a sync `boto3` call sitting inside an `async def`, that's fine here: it runs once at startup, not per-request.
 3. A small `def presigned_put_url(object_key, content_type) -> str` and
    `def presigned_get_url(object_key) -> str` helper pair, both wrapping
    `s3_client.generate_presigned_url(...)` — centralizing the `ExpiresIn`
@@ -1472,9 +1562,9 @@ nothing existing can hold this.
 Plain-English steps:
 - `class Attachment(Base):` `__tablename__ = "attachments"`:
   - `id`, `message_id` (`ForeignKey("messages.id")`), `object_key: str`
-    (the MinIO/S3 object key — deliberately NOT a full URL, since a
-    presigned URL expires and gets regenerated fresh on every read; storing
-    one would just go stale), `original_filename: str`, `mime_type: str`,
+    (the S3 object key — deliberately NOT a full URL, since a presigned URL
+    expires and gets regenerated fresh on every read; storing one would
+    just go stale), `original_filename: str`, `mime_type: str`,
     `size_bytes: int`, `created_at`.
 - Brand new table → `create_all()` handles it on next startup, no manual
   `ALTER TABLE` needed (same as `message_reads` in Step 10).
@@ -1500,7 +1590,7 @@ Why: requesting permission to upload is its own request/response action,
 separate from the WebSocket's job of relaying chat events — matches how
 `conversations.py` already separates plain HTTP actions (create, history)
 from the WebSocket's live-relay job.
-Plain-English steps for `POST /conversations/{conversation_id}/uploads/presign`
+Plain-English steps for `POST /uploads/{conversation_id}/presign`
 (body: `PresignUploadRequest`, behind `get_current_user`):
 1. Authorization — current user must be a `Participant` of
    `conversation_id`, identical pattern to every other route touching a
@@ -1513,7 +1603,7 @@ Plain-English steps for `POST /conversations/{conversation_id}/uploads/presign`
    requests up front, it can't verify what actually gets uploaded after.
 3. Build a unique object key:
    `f"conversations/{conversation_id}/{uuid4()}-{payload.filename}"` —
-   namespaced by conversation (useful for browsing the MinIO console), a
+   namespaced by conversation (useful for browsing the S3 console), a
    UUID prefix so two people uploading a same-named file never collide or
    silently overwrite each other.
 4. `presigned_put_url(object_key, payload.content_type)` from
@@ -1552,17 +1642,21 @@ Plain-English steps:
   message's `MessageResponse`.
 
 **`backend/app/main.py`** (modify)
-- Import `init_bucket` from `app.core.storage`, call `await init_bucket()`
-  in the `lifespan` alongside the existing `await init_models()`.
+- Import `verify_bucket` from `app.core.config` (see the "what actually got
+  built" callout above — it ended up living there, not in a separate
+  `storage.py`), call `await verify_bucket()`
+  in the `lifespan` alongside the existing `await init_models()` — if the
+  bucket doesn't exist or the credentials can't see it, this should fail
+  startup loudly and immediately rather than only surfacing as a confusing
+  403 the first time someone tries to upload a file.
 
-**Checkpoint**: `docker compose up --build` brings up a `minio` container
-too; its web console (`http://localhost:9001`, logged in with
-`MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD`) shows an empty `chat-uploads`
-bucket after the backend's first startup (confirms `init_bucket()` ran).
-Call the presign endpoint for a real conversation with a valid image
-content-type/size, `PUT` a real file to the returned `upload_url` with
-`curl` or a script, confirm the file appears in the MinIO console. Send a
-WS message referencing that `object_key`, confirm a `messages` row AND an
+**Checkpoint**: after completing the one-time manual AWS setup above,
+`docker compose up --build` should start cleanly (confirms `verify_bucket()`
+found the bucket). Call the presign endpoint for a real conversation with a
+valid image content-type/size, `PUT` a real file to the returned
+`upload_url` with `curl` or a script, confirm the file appears in the S3
+console under the expected `conversations/{id}/...` key. Send a WS message
+referencing that `object_key`, confirm a `messages` row AND an
 `attachments` row both exist in Postgres, and the relayed/echoed payload
 contains a working `download_url` you can open directly in a browser.
 Re-fetch conversation history and confirm the attachment still has a valid
@@ -1570,7 +1664,51 @@ Re-fetch conversation history and confirm the attachment still has a valid
 
 ---
 
-## Step 13 — Frontend: file/image uploads (Phase 2)
+## Step 13 — Frontend: file/image uploads (Phase 2) ✅ Done
+
+> **What actually got built, and where it differs from the plan below:**
+> - One addition beyond this plan: `components/MessageList.tsx` also opens a
+>   fullscreen lightbox (dark backdrop, image scaled to fit) when you click
+>   an inline image — click anywhere or press Escape to close. Not in the
+>   original scope, added afterward as a small UX improvement.
+> - A real gap this step's testing surfaced: the bucket needed an explicit
+>   CORS policy before the browser's direct `PUT` to S3 would work at all.
+>   Every backend-side test of Step 12 (curl, a raw Python `websockets`
+>   client) had passed cleanly — but neither of those is a browser, and CORS
+>   is a browser-only enforcement mechanism, so none of that testing could
+>   have caught this. The actual failure in the browser was a generic
+>   `TypeError: Failed to fetch` from `lib/uploads.ts`'s raw `fetch(upload_url,
+>   { method: "PUT", ... })` call — diagnosed by recognizing that a
+>   cross-origin PUT with a non-simple `Content-Type` header triggers a
+>   preflight `OPTIONS` request, which S3 refuses without a CORS
+>   configuration on the bucket. Fixed with a one-time bucket-level CORS
+>   rule (AWS Console → bucket → Permissions → CORS):
+>   ```json
+>   [{
+>     "AllowedHeaders": ["*"],
+>     "AllowedMethods": ["PUT", "GET"],
+>     "AllowedOrigins": ["http://localhost:3000"],
+>     "ExposeHeaders": []
+>   }]
+>   ```
+>   Add the real deployed origin here too once this goes beyond localhost.
+>
+> **Verification**: `npx tsc --noEmit` and `npm run lint` both clean (one
+> benign `next/image` perf suggestion — a plain `<img>` is the right call
+> here since presigned URLs expire and aren't worth `next/image`'s remote-
+> pattern caching). Confirmed live in a real browser, logged in as a real
+> test user: uploaded a real PNG and a real PDF through the exact
+> presign → S3 `PUT` → WebSocket-send path the UI code takes; the image
+> rendered inline with its caption below it, the PDF rendered as a 📄
+> filename link (not a broken image), and clicking the PDF link opened the
+> real file through its presigned URL. No console errors, no CORS failures
+> loading the S3 image. One thing NOT verified by browser automation in this
+> environment: actually clicking the 📎 button and picking a file through the
+> OS-native file dialog — the browser-automation tooling used here can't
+> drive that native dialog, so that specific interaction needs a manual
+> click-through; everything downstream of file selection (`uploadFile`, the
+> presign call, the S3 `PUT`, the WebSocket send, and the rendering) has been
+> exercised with real data and confirmed working.
 
 **Modify/create inside `frontend/`:**
 ```
@@ -1590,20 +1728,19 @@ Plain-English flow:
 
 **`lib/uploads.ts`** (new)
 Why: the upload flow is a multi-step dance (ask backend for permission,
-then talk to MinIO directly) that doesn't belong inlined in a component.
+then talk to S3 directly) that doesn't belong inlined in a component.
 Plain-English steps:
 1. `async function uploadFile(conversationId, file): Promise<{object_key, original_filename, mime_type, size_bytes}>`.
 2. Call the presign endpoint via the existing `apiJson` helper:
-   `POST /conversations/${conversationId}/uploads/presign` with
+   `POST /uploads/${conversationId}/presign` with
    `{filename: file.name, content_type: file.type, size_bytes: file.size}`.
 3. `fetch(upload_url, { method: "PUT", body: file, headers: { "Content-Type": file.type } })`
    — a RAW `fetch`, deliberately NOT `apiJson`/`apiFetch`: this request goes
-   to MinIO, not your backend, and must NOT carry your app's
-   `Authorization` bearer token — the presigned URL itself IS the auth, and
-   an unexpected extra header could even invalidate MinIO's signature
-   check.
+   to S3, not your backend, and must NOT carry your app's `Authorization`
+   bearer token — the presigned URL itself IS the auth, and an unexpected
+   extra header could even invalidate S3's signature check.
 4. Return the metadata the caller needs to send over the WebSocket next —
-   this function's job ends once the bytes are safely in MinIO.
+   this function's job ends once the bytes are safely in S3.
 
 **`components/MessageInput.tsx`** (modify)
 Plain-English flow:
@@ -1654,4 +1791,4 @@ reload, which would actually indicate the history endpoint isn't
 regenerating it fresh as designed). Send a non-image file (e.g. a PDF) and
 confirm it renders as a download link, not a broken image tag. Try a file
 over the size cap or an unsupported type and confirm the upload is rejected
-with a visible error before anything reaches MinIO.
+with a visible error before anything reaches S3.
