@@ -3,14 +3,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from app.db.init_db import init_models
 
-from app.api.routes import auth
-from app.api.routes import conversations
-from app.api.routes import users
+from app.api.routes import auth, conversations, users, uploads
 from app.api.ws import chat
+from app.core.config import verify_bucket
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_models()
+    await verify_bucket()
     yield
 
 app = FastAPI(lifespan=lifespan)
@@ -23,6 +23,7 @@ app.add_middleware(
 
 )
 
+app.include_router(uploads.router, prefix="/uploads", tags=["uploads"])
 app.include_router(auth.router, prefix="/auth", tags=["auth"])
 
 app.include_router(conversations.router, prefix="/conversations", tags=["conversations"])

@@ -5,6 +5,7 @@ import { useParams, useRouter } from "next/navigation";
 import { apiJson } from "@/lib/api";
 import { isAuthenticated, getCurrentUserId } from "@/lib/auth";
 import { useChatSocket } from "@/lib/websocket";
+import type { UploadedAttachment } from "@/lib/uploads";
 import { MessageList } from "@/components/MessageList";
 import { MessageInput } from "@/components/MessageInput";
 import type { ConversationSummary, Message, MessagePage } from "@/types";
@@ -101,7 +102,7 @@ export default function ConversationPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [conversationId, router]);
 
-  const { sendMessage, sendTyping } = useChatSocket(conversationId, {
+  const { sendMessage, sendFileMessage, sendTyping } = useChatSocket(conversationId, {
     onMessage: (message) => {
       if (message.sender_id === currentUserId) {
         // This is the self-echo of a message we sent — swap the oldest
@@ -171,6 +172,28 @@ export default function ConversationPage() {
     ]);
   }
 
+  // The file's bytes are already sitting in S3 by the time this fires (see
+  // MessageInput's onSendFile) — this just mirrors handleSend's optimistic
+  // placeholder + pendingSentIdsRef reconciliation so the sender sees
+  // something immediately instead of waiting on the self-echo round trip.
+  function handleSendFile(attachment: UploadedAttachment) {
+    sendFileMessage(attachment, "");
+    const placeholderId = -Date.now();
+    pendingSentIdsRef.current.push(placeholderId);
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: placeholderId,
+        conversation_id: conversationId,
+        sender_id: currentUserId as number,
+        content: attachment.mime_type.startsWith("image/") ? "Uploading image…" : "Uploading file…",
+        type: attachment.mime_type.startsWith("image/") ? "image" : "file",
+        created_at: new Date().toISOString(),
+        read_by: [],
+      },
+    ]);
+  }
+
   async function handleLoadOlder() {
     if (nextCursor === null) return;
     try {
@@ -210,7 +233,12 @@ export default function ConversationPage() {
         />
       )}
 
-      <MessageInput onSend={handleSend} onTyping={sendTyping} />
+      <MessageInput
+        conversationId={conversationId}
+        onSend={handleSend}
+        onSendFile={handleSendFile}
+        onTyping={sendTyping}
+      />
     </div>
   );
 }

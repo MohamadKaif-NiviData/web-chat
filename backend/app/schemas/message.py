@@ -1,5 +1,6 @@
 from pydantic import BaseModel, ConfigDict
 from datetime import datetime
+from app.schemas.attachment import AttachmentResponse
 
 class MessageResponse(BaseModel):
     id:int
@@ -10,6 +11,7 @@ class MessageResponse(BaseModel):
     created_at: datetime
     read_by: list[int] = []
     model_config = ConfigDict(from_attributes=True)
+    attachment: AttachmentResponse | None = None
 
 class MessagePage(BaseModel):
     messages: list[MessageResponse]

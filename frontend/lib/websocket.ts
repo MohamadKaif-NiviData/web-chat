@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { WS_BASE_URL } from "./config";
 import { getAccessToken } from "./auth";
+import type { UploadedAttachment } from "./uploads";
 import type { Message, ReadEvent, TypingEvent } from "@/types";
 
 const TYPING_THROTTLE_MS = 2000;
@@ -55,6 +56,22 @@ export function useChatSocket(conversationId: number | null, handlers: ChatSocke
     socketRef.current?.send(JSON.stringify({ content }));
   }, []);
 
+  // A file message reuses the same create-relay-echo flow as a text message
+  // (chat.py), just with the attachment metadata riding along — the caption
+  // is optional and maps onto the same `content` field a text message uses.
+  const sendFileMessage = useCallback((attachment: UploadedAttachment, caption: string) => {
+    socketRef.current?.send(
+      JSON.stringify({
+        content: caption,
+        type: attachment.mime_type.startsWith("image/") ? "image" : "file",
+        object_key: attachment.object_key,
+        original_filename: attachment.original_filename,
+        mime_type: attachment.mime_type,
+        size_bytes: attachment.size_bytes,
+      }),
+    );
+  }, []);
+
   // Throttled to at most one "typing" event every TYPING_THROTTLE_MS while
   // the user is actively typing — the receiving end handles its own
   // auto-hide timeout, so no explicit "stopped typing" event is needed.
@@ -65,5 +82,5 @@ export function useChatSocket(conversationId: number | null, handlers: ChatSocke
     socketRef.current?.send(JSON.stringify({ type: "typing" }));
   }, []);
 
-  return { connected, sendMessage, sendTyping };
+  return { connected, sendMessage, sendFileMessage, sendTyping };
 }
