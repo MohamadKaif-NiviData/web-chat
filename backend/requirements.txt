@@ -27,3 +27,10 @@ python-dotenv==1.0.1
 
 #aws setup
 boto3==1.28.44
+
+# --- Push notifications (Web Push + VAPID) ---
+# Pinned to 2.5.0, not the older 1.14.0: that version calls
+# ec.generate_private_key(ec.SECP256R1, ...) with the curve CLASS instead of
+# an INSTANCE, which newer `cryptography` releases reject outright
+# (TypeError: curve must be an EllipticCurve instance) — fixed upstream by 2.5.0.
+pywebpush==2.5.0

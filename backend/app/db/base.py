@@ -6,4 +6,4 @@ class Base(DeclarativeBase):
     pass
 
 
-from app.models import user, conversation, message, message_read, attachment
+from app.models import user, conversation, message, message_read, attachment, push_subscription

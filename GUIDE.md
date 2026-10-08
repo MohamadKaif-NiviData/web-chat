@@ -25,17 +25,28 @@ WebSocket chat with pagination → presence/typing → frontend auth + chat UI.
 | 11 — Frontend: read receipts (Phase 2) | ✅ Done |
 | 12 — Backend: file/image uploads (Phase 2) | ✅ Done |
 | 13 — Frontend: file/image uploads (Phase 2) | ✅ Done |
+| 14 — Backend: push notifications (Phase 2) | ⬜ Not started |
+| 15 — Frontend: push notifications (Phase 2) | ⬜ Not started |
 
-**Next up: push notifications** — the last piece of Phase 2. File/image
-uploads (Steps 12-13) are fully done and verified end-to-end against a real
-AWS S3 bucket: presign → direct browser-to-S3 `PUT` → WebSocket relay/echo
-with a fresh presigned download URL → inline image (with a click-to-expand
-lightbox) or a download link for non-images, confirmed both via live
-WebSocket/API testing and by actually clicking through the running frontend
-in a browser. See the verification callouts inside Steps 12 and 13 below for
-the real bugs hit along the way (an attachment-before-commit ordering bug, a
-missing S3 CORS policy, a couple of bad import paths) and how each was
-diagnosed and fixed.
+**Next up: Step 14** — the last Phase 2 feature before Phase 3's RAG work.
+File/image uploads (Steps 12-13) are fully done and verified end-to-end
+against a real AWS S3 bucket: presign → direct browser-to-S3 `PUT` →
+WebSocket relay/echo with a fresh presigned download URL → inline image
+(with a click-to-expand lightbox) or a download link for non-images,
+confirmed both via live WebSocket/API testing and by actually clicking
+through the running frontend in a browser. See the verification callouts
+inside Steps 12 and 13 below for the real bugs hit along the way (an
+attachment-before-commit ordering bug, a missing S3 CORS policy, a couple of
+bad import paths) and how each was diagnosed and fixed.
+
+Steps 14-15 are planned but not yet built — worth flagging the one design
+point that's easy to get backwards going in: a push notification should
+fire when a recipient has NO active WebSocket connection, not when they're
+online. An already-connected recipient already receives the message live
+through the existing fan-out relay in `chat.py` — pushing them an OS
+notification on top of that would just double up on something already on
+their screen. See Step 14's "Design decisions locked in" callout below for
+the full reasoning and where this hooks into the existing code.
 
 > **Step 11 verification, and a real bug it surfaced**: confirmed live in
 > the browser with the Chrome extension, using one real session ("N") plus a
@@ -1792,3 +1803,250 @@ regenerating it fresh as designed). Send a non-image file (e.g. a PDF) and
 confirm it renders as a download link, not a broken image tag. Try a file
 over the size cap or an unsupported type and confirm the upload is rejected
 with a visible error before anything reaches S3.
+
+---
+
+## Step 14 — Backend: push notifications (Phase 2)
+
+Phase 2 scope (from PLAN.md): group chats ✅ → read receipts ✅ → file/image
+uploads ✅ → **push notifications**, the last Phase 2 feature before Phase 3's
+RAG work begins.
+
+> **Design decisions locked in before writing this step:**
+> - **Trigger condition: the recipient has NO active WebSocket connection,
+>   not "the recipient is online."** This is the one point worth being
+>   explicit about, since it's easy to get backwards: a push notification's
+>   entire purpose is reaching someone who ISN'T currently looking at the
+>   app. A connected recipient already receives the message live through
+>   `chat.py`'s existing fan-out loop (`manager.send_to_user(uid, payload)`)
+>   — sending them a push on top of that would just double up as a
+>   redundant OS-level popup for something already on their screen.
+>   `PLAN.md`'s own feature list says this directly: "Push notifications
+>   (for offline users)."
+> - **Signal source: `ConnectionManager.active_connections`, not Redis
+>   presence.** Both describe roughly the same fact, but `manager`'s own
+>   in-memory registry is the literal, zero-latency truth ("is there an open
+>   socket for this user on THIS process right now"), whereas Redis presence
+>   is a TTL-based derivative of it with up to ~30s of staleness after a real
+>   disconnect (Step 6's self-healing design). Using presence here risks
+>   skipping a push for someone who disconnected seconds ago but whose
+>   presence key hasn't expired yet. Checking `manager` avoids both the
+>   staleness window and an extra async Redis round-trip inside the
+>   message-send path.
+> - **Known, accepted limitation — stated plainly, not silently glossed
+>   over:** `ConnectionManager` keys connections by `user_id` alone, not
+>   `(user_id, conversation_id)` — a single open tab counts as "connected"
+>   regardless of which conversation it's showing. So a user actively
+>   chatting in conversation A will NOT get a push for a new message in
+>   conversation B, even though they aren't actually looking at B. Correctly
+>   scoping "connected to THIS conversation" would need `ConnectionManager`
+>   to track which conversation(s) each socket is viewing — a reasonable
+>   future refinement, out of scope for this phase (same spirit as the
+>   presign endpoint's "can't verify actual uploaded bytes" limitation called
+>   out in Step 12).
+> - **Delivery: Web Push API + VAPID via `pywebpush`, sent inline from the
+>   WebSocket handler — no Celery queue yet.** `PLAN.md`'s tech-stack table
+>   originally earmarks Celery for "push notification dispatch," but Celery's
+>   actual justification in this project is Phase 3's doc-ingestion/embedding
+>   pipeline (a genuinely slow, multi-step background job) — a single push
+>   send is one outbound HTTPS call to a browser's push service, fast enough
+>   to `await` (wrapped via a thread executor, since `pywebpush` itself is
+>   sync/blocking) without holding up the WebSocket loop noticeably. Standing
+>   up a whole worker service for this alone would be solving a problem this
+>   phase doesn't have yet — same reasoning Step 6 used to defer Redis
+>   pub/sub until there's more than one backend replica. Revisit if Phase 3's
+>   Celery worker ends up getting built anyway (it will, for RAG ingestion) —
+>   at that point moving push dispatch onto the same queue becomes close to
+>   free.
+> - **A push subscription can go stale** (user revoked notification
+>   permission, uninstalled, cleared site data) — `pywebpush` raises an error
+>   (commonly a 410 Gone from the push service) when this happens. Handle by
+>   deleting that subscription row so future sends don't keep retrying a dead
+>   endpoint — don't let a stale subscription silently accumulate failed
+>   attempts forever.
+
+**Create/modify:**
+```
+.env                             (modify — VAPID keypair)
+backend/requirements.txt         (modify — add pywebpush)
+backend/app/
+├── core/
+│   └── config.py                (modify — VAPID settings)
+├── models/
+│   └── push_subscription.py     (new)
+├── db/
+│   └── base.py                  (modify — import push_subscription)
+├── schemas/
+│   └── push_subscription.py     (new)
+├── services/
+│   └── push.py                  (new — send_push_notification())
+├── api/
+│   ├── routes/
+│   │   └── push.py              (new — subscribe/unsubscribe endpoints)
+│   └── ws/
+│       └── chat.py              (modify — push the offline branch of the
+│                                  existing fan-out loop)
+└── main.py                      (modify — register push.router)
+```
+
+**One-time manual setup (not code):**
+1. Generate a VAPID key pair once (e.g. `pywebpush`'s own `vapid.py` CLI, or
+   the `py-vapid` package's `vapid --gen` command) — a public key and a
+   private key, plus a contact email VAPID requires for its "claims."
+2. Add `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_CLAIMS_EMAIL` to
+   `.env`. The public key also needs to reach the frontend (it's not a
+   secret — browsers need it to create a subscription), so it'll be read
+   from a public config value on the frontend side in Step 15, not hardcoded
+   twice.
+
+**`backend/app/models/push_subscription.py`** (new)
+Why: one user can grant notification permission from multiple
+browsers/devices — each is a genuinely separate subscription, so this needs
+its own table rather than a column on `users`.
+Plain-English steps:
+- `class PushSubscription(Base):` `__tablename__ = "push_subscriptions"`:
+  - `id`, `user_id` (`ForeignKey("users.id")`), `endpoint: str` (the
+    browser's push-service URL — unique per subscription), `p256dh: str`
+    and `auth: str` (the two keys the Push API's `subscribe()` call
+    returns, needed to encrypt the payload), `created_at`.
+- Brand new table → `create_all()` handles it, no manual `ALTER TABLE`
+  needed (same as every other new table added so far).
+
+**`backend/app/db/base.py`** (modify)
+- Add `push_subscription` to the bottom-of-file import line, same pattern as
+  every other model.
+
+**`backend/app/schemas/push_subscription.py`** (new)
+Plain-English steps:
+- `PushSubscriptionRequest(BaseModel)`: `endpoint: str`, `keys: dict` (or
+  explicit `p256dh: str` / `auth: str` fields) — mirrors the exact shape the
+  browser's `PushSubscription.toJSON()` produces, so the frontend can send
+  it through basically unchanged.
+
+**`backend/app/core/config.py`** (modify)
+- Add `vapid_public_key`, `vapid_private_key`, `vapid_claims_email` fields
+  to `Settings`.
+
+**`backend/app/services/push.py`** (new)
+Why: same "one shared helper, not reimplemented per call site" reasoning as
+`storage`'s presigned-URL helpers.
+Plain-English steps:
+1. `async def send_push_notification(db, user_id, title, body, conversation_id)`:
+   query all `PushSubscription` rows for `user_id` (there may be several —
+   loop over every one, not just the first).
+2. For each subscription, call `pywebpush.webpush(subscription_info={...},
+   data=json.dumps({"title": title, "body": body, "conversation_id":
+   conversation_id}), vapid_private_key=settings.vapid_private_key,
+   vapid_claims={"sub": f"mailto:{settings.vapid_claims_email}"})` — wrapped
+   in `asyncio.to_thread(...)` since `pywebpush` itself makes a blocking
+   HTTP call.
+3. Catch `WebPushException`: if the push service responds 404/410 (endpoint
+   gone), delete that `PushSubscription` row — a dead subscription should
+   stop being retried, not fail silently forever on every future message.
+
+**`backend/app/api/routes/push.py`** (new)
+Plain-English steps for `POST /push/subscribe` (body:
+`PushSubscriptionRequest`, behind `get_current_user`):
+1. Upsert a `PushSubscription` row for `(current_user.id, endpoint)` — if
+   the same browser subscribes twice (e.g. page reload re-registers), update
+   the existing row's keys rather than creating a duplicate.
+Plain-English steps for `DELETE /push/subscribe` (body: `{endpoint: str}`,
+behind `get_current_user`):
+1. Delete the matching `PushSubscription` row — lets the frontend clean up
+   when the user explicitly disables notifications, instead of only ever
+   relying on the 410-triggered cleanup in `push.py`'s service layer.
+
+**`backend/app/api/ws/chat.py`** (modify)
+Why: this is the one real behavior change — everywhere the existing code
+loops over `other_user_ids` to relay a live message, it now also needs to
+decide "did this person actually receive that relay, or are they offline?"
+Plain-English steps:
+1. Right where the existing loop does
+   `for uid in other_user_ids: await manager.send_to_user(uid, payload)`,
+   branch per recipient: if `manager.active_connections.get(uid)` is
+   truthy, send live exactly as today; if NOT (no open socket for that
+   user_id at all), call
+   `await send_push_notification(db, uid, title=sender_display_name,
+   body=message.content or "Sent an attachment", conversation_id=conversation_id)`
+   instead.
+2. Nothing about the sender's own self-echo changes — you never push-notify
+   yourself.
+
+**`backend/app/main.py`** (modify)
+- Import and register `push.router` the same way every other router is
+  wired in (`app.include_router(push.router, prefix="/push", tags=["push"])`).
+
+**Checkpoint**: subscribe a test browser via `POST /push/subscribe` with a
+real `PushSubscription` payload, confirm the row lands in
+`push_subscriptions`. With that same user's WebSocket deliberately NOT
+connected, send a message to them from another user and confirm a real OS
+notification appears (test via a script calling `send_push_notification`
+directly against a real subscription, same spirit as Step 12's curl-based
+backend verification before any frontend existed). Then connect that same
+user's WebSocket and send another message — confirm NO push fires this time,
+only the live relay. Revoke notification permission in the browser, send a
+message again, confirm the stale subscription gets deleted after the first
+failed send rather than erroring on every subsequent message.
+
+---
+
+## Step 15 — Frontend: push notifications (Phase 2)
+
+**Modify/create inside `frontend/`:**
+```
+public/sw.js                              (new — service worker)
+lib/push.ts                               (new)
+lib/config.ts                             (modify — expose VAPID public key)
+app/chat/page.tsx                         (modify — "Enable notifications" entry point)
+```
+
+**`public/sw.js`** (new)
+Why: the Push API fundamentally requires a Service Worker — the browser
+delivers a push event to this background script even when no tab for your
+site is open, which is the entire point ("offline" here means "no open
+WebSocket," but the user's browser itself still needs to be running for a
+push to be deliverable at all — that's a Push API constraint, not something
+this app's design controls).
+Plain-English steps:
+1. Listen for the `push` event: parse `event.data.json()` (the
+   `{title, body, conversation_id}` payload `services/push.py` sent),
+   call `self.registration.showNotification(title, { body, data:
+   { conversation_id } })`.
+2. Listen for `notificationclick`: close the notification and
+   `clients.openWindow()` to `/chat/{conversation_id}` — clicking a push
+   should take you straight to the relevant conversation, not just the
+   generic chat list.
+
+**`lib/push.ts`** (new)
+Plain-English steps:
+1. `async function enablePushNotifications()`: call
+   `Notification.requestPermission()` — if denied, stop and surface that to
+   the caller rather than silently retrying.
+2. `navigator.serviceWorker.register("/sw.js")`, then
+   `registration.pushManager.subscribe({ userVisibleOnly: true,
+   applicationServerKey: VAPID_PUBLIC_KEY })` — `userVisibleOnly: true` is
+   required by the Push API spec (a page can't silently receive pushes
+   without ever showing the user something).
+3. POST the resulting subscription (`subscription.toJSON()`) to
+   `/push/subscribe` via the existing `apiJson` helper.
+
+**`lib/config.ts`** (modify)
+- Add `VAPID_PUBLIC_KEY` read from a `NEXT_PUBLIC_...` env var — needs the
+  `NEXT_PUBLIC_` prefix because, unlike the backend's secret VAPID private
+  key, this value legitimately needs to reach client-side JS.
+
+**`app/chat/page.tsx`** (modify)
+Plain-English flow:
+- Add a small "Enable notifications" button/banner (skip rendering it
+  entirely if `Notification.permission === "granted"` already, or if the
+  Push API isn't supported in this browser at all) that calls
+  `enablePushNotifications()` from `lib/push.ts` on click.
+
+**Checkpoint**: click "Enable notifications," grant the browser permission
+prompt, confirm a `push_subscriptions` row appears for your user. Close the
+tab (or just the specific conversation — remember Step 14's known
+limitation: any open tab counts as "connected," so fully close the app to
+test this) and have another user send you a message — confirm a real OS-level
+notification appears, and clicking it opens the right conversation. Reopen
+the tab/app and send another message from the other side — confirm this
+time NO push fires, since you're connected again and get it live instead.
