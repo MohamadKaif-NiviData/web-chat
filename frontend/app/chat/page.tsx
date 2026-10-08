@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { isAuthenticated, logout } from "@/lib/auth";
 import { apiJson } from "@/lib/api";
 import { ConversationList } from "@/components/ConversationList";
+import { NotificationToggle } from "@/components/NotificationToggle";
 import type { ConversationSummary, ConversationCreateResponse, User } from "@/types";
 
 export default function ChatListPage() {
@@ -114,9 +115,12 @@ export default function ChatListPage() {
     <div className="mx-auto flex w-full max-w-md flex-1 flex-col">
       <div className="flex items-center justify-between border-b px-4 py-3">
         <h1 className="text-lg font-semibold">Chats</h1>
-        <button onClick={handleLogout} className="text-sm text-zinc-500 underline">
-          Log out
-        </button>
+        <div className="flex items-center gap-3">
+          <NotificationToggle />
+          <button onClick={handleLogout} className="text-sm text-zinc-500 underline">
+            Log out
+          </button>
+        </div>
       </div>
       <div className="flex flex-col gap-2 border-t border-b  p-3">
         {!showStartForm && !showGroupForm && (

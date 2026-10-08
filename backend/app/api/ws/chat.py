@@ -12,6 +12,8 @@ from app.schemas.message import MessageResponse
 from app.services.connection_manager import manager
 from app.services.presence import set_online, set_offline
 from app.models.attachment import Attachment
+from app.models.user import User
+from app.services.push import send_push_notification
 from app.core.config import presigned_get_url, settings
 
 
@@ -128,8 +130,35 @@ async def chat_endpoint(
                     "size_bytes": attachment.size_bytes,
                 }
 
-            for uid in other_user_ids:
+            offline_uids = [
+                uid for uid in other_user_ids if not manager.active_connections.get(uid)
+            ]
+            online_uids = [uid for uid in other_user_ids if uid not in offline_uids]
+
+            for uid in online_uids:
                 await manager.send_to_user(uid, payload)
+
+            if offline_uids:
+                sender = await db.execute(
+                    select(User.display_name).where(User.id == user_id)
+                )
+                sender_display_name = sender.scalar_one()
+
+                if message.content:
+                    notification_body = message.content
+                elif attachment and attachment.mime_type.startswith("image/"):
+                    notification_body = "Sent an image"
+                else:
+                    notification_body = "Sent a file"
+
+                for uid in offline_uids:
+                    await send_push_notification(
+                        db,
+                        uid,
+                        title=sender_display_name,
+                        body=notification_body,
+                        conversation_id=conversation_id,
+                    )
 
             # Echo the persisted message back to the SENDER's own socket too.
             # Read receipts need this: the frontend optimistically shows your

@@ -12,6 +12,9 @@ class Settings(BaseSettings):
     aws_access_key_id : str
     aws_secret_access_key : str
     aws_region : str
+    vapid_public_key : str
+    vapid_private_key : str
+    vapid_claims_email : str
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
 settings = Settings()    
