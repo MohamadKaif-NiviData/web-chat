@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     vapid_public_key : str
     vapid_private_key : str
     vapid_claims_email : str
+    ollama_base_url : str
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
 settings = Settings()    

@@ -24,7 +24,8 @@ augmented generation together, the way a real product would need them.
 | Background jobs | Celery + Redis broker | Doc ingestion/embedding for RAG bot, push notification dispatch |
 | File storage | MinIO (S3-compatible, local) | Image/file uploads via pre-signed URLs |
 | Push notifications | Web Push API (VAPID) | Standard, self-hostable, no vendor lock-in |
-| Infra | Docker Compose | frontend, backend, worker, postgres, redis, minio — one command up |
+| Standalone AI chat | Ollama (self-hosted, own container) | Direct LLM chat outside the RAG roadmap — see "Standalone AI chatbot" below |
+| Infra | Docker Compose | frontend, backend, worker, postgres, redis, minio, ollama — one command up |
 
 ---
 
@@ -33,9 +34,10 @@ augmented generation together, the way a real product would need them.
 ```
 Next.js (TS) ──WebSocket/HTTP── FastAPI ──┬── Postgres (users, chats, messages, read receipts)
                                             ├── Redis (pub/sub for WS fan-out, presence, typing state)
-                                            ├── Celery worker (doc ingestion → embed → pgvector)
+                                            ├── Celery worker (doc ingestion → embed → pgvector)    [Phase 3, not built]
                                             ├── MinIO/S3 (file & image uploads)
-                                            └── Web Push (VAPID) for notifications
+                                            ├── Web Push (VAPID) for notifications
+                                            └── Ollama (standalone AI chat — unrelated to RAG above)
 ```
 
 **Why Redis pub/sub matters**: if more than one FastAPI instance runs, a
@@ -49,6 +51,15 @@ to any conversation. Dropping a document into a conversation triggers a
 Celery ingestion job (extract → chunk → embed → store in pgvector). Mentioning
 the bot triggers a similarity search + streamed, cited answer back into the
 chat like a normal message.
+
+**Standalone AI chatbot (built, separate from the above)**: a simpler,
+earlier, unrelated feature — a "Chat with AI" button opens its own page for
+direct LLM chat via a self-hosted Ollama container. No RAG, no pgvector, no
+Celery, no conversation participant — ephemeral, plain REST, isolated from
+the `Conversation`/`Participant`/`Message` tables entirely. This is NOT
+Phase 3's RAG bot and doesn't advance that roadmap item; it may or may not
+end up reusing the Ollama container once Phase 3 is actually built. Full
+rationale in `AI_CHATBOT_PLAN.md`; build log in `GUIDE.md` Steps 16-17.
 
 ---
 
