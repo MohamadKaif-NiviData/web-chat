@@ -25,28 +25,36 @@ WebSocket chat with pagination → presence/typing → frontend auth + chat UI.
 | 11 — Frontend: read receipts (Phase 2) | ✅ Done |
 | 12 — Backend: file/image uploads (Phase 2) | ✅ Done |
 | 13 — Frontend: file/image uploads (Phase 2) | ✅ Done |
-| 14 — Backend: push notifications (Phase 2) | ⬜ Not started |
-| 15 — Frontend: push notifications (Phase 2) | ⬜ Not started |
+| 14 — Backend: push notifications (Phase 2) | ✅ Done |
+| 15 — Frontend: push notifications (Phase 2) | ✅ Done |
+| 16 — Backend: AI chatbot (Ollama, standalone) | ✅ Done |
+| 17 — Frontend: AI chatbot (Ollama, standalone) | ✅ Done |
 
-**Next up: Step 14** — the last Phase 2 feature before Phase 3's RAG work.
-File/image uploads (Steps 12-13) are fully done and verified end-to-end
-against a real AWS S3 bucket: presign → direct browser-to-S3 `PUT` →
-WebSocket relay/echo with a fresh presigned download URL → inline image
-(with a click-to-expand lightbox) or a download link for non-images,
-confirmed both via live WebSocket/API testing and by actually clicking
-through the running frontend in a browser. See the verification callouts
-inside Steps 12 and 13 below for the real bugs hit along the way (an
-attachment-before-commit ordering bug, a missing S3 CORS policy, a couple of
-bad import paths) and how each was diagnosed and fixed.
+**Phase 2 is now fully done.** File/image uploads (Steps 12-13) are
+verified end-to-end against a real AWS S3 bucket: presign → direct
+browser-to-S3 `PUT` → WebSocket relay/echo with a fresh presigned download
+URL → inline image (with a click-to-expand lightbox) or a download link for
+non-images, confirmed both via live WebSocket/API testing and by actually
+clicking through the running frontend in a browser. See the verification
+callouts inside Steps 12 and 13 below for the real bugs hit along the way
+(an attachment-before-commit ordering bug, a missing S3 CORS policy, a
+couple of bad import paths) and how each was diagnosed and fixed.
 
-Steps 14-15 are planned but not yet built — worth flagging the one design
-point that's easy to get backwards going in: a push notification should
-fire when a recipient has NO active WebSocket connection, not when they're
-online. An already-connected recipient already receives the message live
-through the existing fan-out relay in `chat.py` — pushing them an OS
-notification on top of that would just double up on something already on
-their screen. See Step 14's "Design decisions locked in" callout below for
-the full reasoning and where this hooks into the existing code.
+Push notifications (Steps 14-15) are done and verified end-to-end against a
+real browser subscription (real FCM endpoint, real OS-level notification
+observed) — see each step's verification callout below for specifics,
+including a couple of corrections made during implementation to what this
+guide originally planned.
+
+**Also done, outside the original Phase 1/2/3 roadmap**: Steps 16-17 add a
+standalone "Chat with AI" feature backed by a self-hosted Ollama container —
+simple, non-RAG, ephemeral direct LLM chat. This is deliberately NOT
+Phase 3's RAG bot (see Step 16's note on how the two relate); full design
+docs live in `AI_CHATBOT_PLAN.md`, `AI_CHATBOT_USER_STORIES.md`, and
+`AI_CHATBOT_IMPLEMENTATION_STEPS.md`.
+
+**Next up**: Phase 3's actual RAG work (pgvector + Celery + AI bot
+participant) — not started, see `PLAN.md`'s build order items 9-10.
 
 > **Step 11 verification, and a real bug it surfaced**: confirmed live in
 > the browser with the Chrome extension, using one real session ("N") plus a
@@ -1806,7 +1814,7 @@ with a visible error before anything reaches S3.
 
 ---
 
-## Step 14 — Backend: push notifications (Phase 2)
+## Step 14 — Backend: push notifications (Phase 2) ✅ Done
 
 Phase 2 scope (from PLAN.md): group chats ✅ → read receipts ✅ → file/image
 uploads ✅ → **push notifications**, the last Phase 2 feature before Phase 3's
@@ -1947,14 +1955,23 @@ Plain-English steps:
 **`backend/app/api/routes/push.py`** (new)
 Plain-English steps for `POST /push/subscribe` (body:
 `PushSubscriptionRequest`, behind `get_current_user`):
-1. Upsert a `PushSubscription` row for `(current_user.id, endpoint)` — if
-   the same browser subscribes twice (e.g. page reload re-registers), update
-   the existing row's keys rather than creating a duplicate.
+1. **Corrected during implementation**: upsert by looking up `endpoint`
+   ALONE, not `(current_user.id, endpoint)`. Reasoning: the same
+   browser/device could later be used by a different logged-in user (shared
+   computer, or someone switching accounts) — looking up by endpoint only
+   and reassigning `user_id` to whoever is currently authenticated means
+   that device always notifies whoever is CURRENTLY logged in on it, never a
+   stale previous user. This also naturally covers "the same browser
+   subscribes twice" without any extra branching.
+2. If found: update its `user_id`/`p256dh`/`auth`. If not found: insert a
+   new row for `current_user.id`.
 Plain-English steps for `DELETE /push/subscribe` (body: `{endpoint: str}`,
 behind `get_current_user`):
-1. Delete the matching `PushSubscription` row — lets the frontend clean up
-   when the user explicitly disables notifications, instead of only ever
-   relying on the 410-triggered cleanup in `push.py`'s service layer.
+1. Delete the matching `PushSubscription` row **scoped to `endpoint` AND
+   `user_id == current_user.id`** — unlike subscribe, the `user_id` check
+   matters here: it stops one user from deleting someone else's subscription
+   by guessing/replaying an endpoint they don't own.
+2. No error if nothing matched — this call should be safely repeatable.
 
 **`backend/app/api/ws/chat.py`** (modify)
 Why: this is the one real behavior change — everywhere the existing code
@@ -1963,42 +1980,67 @@ decide "did this person actually receive that relay, or are they offline?"
 Plain-English steps:
 1. Right where the existing loop does
    `for uid in other_user_ids: await manager.send_to_user(uid, payload)`,
-   branch per recipient: if `manager.active_connections.get(uid)` is
-   truthy, send live exactly as today; if NOT (no open socket for that
-   user_id at all), call
-   `await send_push_notification(db, uid, title=sender_display_name,
-   body=message.content or "Sent an attachment", conversation_id=conversation_id)`
-   instead.
-2. Nothing about the sender's own self-echo changes — you never push-notify
+   split `other_user_ids` into `offline_uids` (where
+   `manager.active_connections.get(uid)` is falsy) and everyone else; send
+   live to everyone else exactly as today.
+2. Only if `offline_uids` is non-empty (skip the extra work entirely when
+   every recipient is online): look up the sender's `display_name` once, and
+   compute the notification body — `message.content` if present, else "Sent
+   an image" or "Sent a file" depending on whether `attachment.mime_type`
+   starts with `image/` (covers an attachment sent with no caption, more
+   specific than a flat "Sent an attachment").
+3. For each `uid` in `offline_uids`, call `await send_push_notification(db,
+   uid, title=sender_display_name, body=notification_body,
+   conversation_id=conversation_id)`.
+4. Nothing about the sender's own self-echo changes — you never push-notify
    yourself.
 
 **`backend/app/main.py`** (modify)
 - Import and register `push.router` the same way every other router is
   wired in (`app.include_router(push.router, prefix="/push", tags=["push"])`).
 
-**Checkpoint**: subscribe a test browser via `POST /push/subscribe` with a
-real `PushSubscription` payload, confirm the row lands in
-`push_subscriptions`. With that same user's WebSocket deliberately NOT
-connected, send a message to them from another user and confirm a real OS
-notification appears (test via a script calling `send_push_notification`
-directly against a real subscription, same spirit as Step 12's curl-based
-backend verification before any frontend existed). Then connect that same
-user's WebSocket and send another message — confirm NO push fires this time,
-only the live relay. Revoke notification permission in the browser, send a
-message again, confirm the stale subscription gets deleted after the first
-failed send rather than erroring on every subsequent message.
+> **Verification, actually run against the live stack**: subscribed a test
+> user via `POST /push/subscribe`, confirmed one row in `push_subscriptions`;
+> re-POSTing the exact same `endpoint` left exactly ONE row with updated
+> keys (confirms upsert, not duplication). `DELETE /push/subscribe` removed
+> it and was safely repeatable (second call: no error, nothing to remove).
+> With that user's WebSocket deliberately not connected, sent a message from
+> another user via a raw `websockets` script (same "exercise the engine
+> before any UI" approach as Step 12) — backend logs showed the
+> `push_subscriptions` query and a real `webpush()` call attempted. Hit a
+> structurally-valid-but-fake subscription (`httpx`-accessible 404 endpoint)
+> to confirm dead-subscription cleanup: the row was silently deleted after
+> the push service's 404, no traceback. Connected that same user's socket
+> and sent another message — confirmed NO `push_subscriptions` query even
+> ran this time (checked via SQL query logs), only the live relay. A
+> captionless image attachment to an offline recipient produced the "Sent an
+> image" body correctly. A 3-person group with one offline member confirmed
+> only that member's subscription was queried — the two connected members
+> got nothing but the live relay. No unhandled tracebacks anywhere across
+> the whole run.
 
 ---
 
-## Step 15 — Frontend: push notifications (Phase 2)
+## Step 15 — Frontend: push notifications (Phase 2) ✅ Done
 
 **Modify/create inside `frontend/`:**
 ```
 public/sw.js                              (new — service worker)
 lib/push.ts                               (new)
-lib/config.ts                             (modify — expose VAPID public key)
-app/chat/page.tsx                         (modify — "Enable notifications" entry point)
+components/NotificationToggle.tsx         (new — Enable/Disable button)
+app/chat/page.tsx                         (modify — renders NotificationToggle)
+backend/app/api/routes/push.py            (modify — GET /push/vapid-public-key)
 ```
+
+**Corrected during implementation — how the VAPID public key reaches the
+browser**: the original plan below was a `NEXT_PUBLIC_VAPID_PUBLIC_KEY` env
+var in `lib/config.ts`. Built it differently instead: an unauthenticated
+`GET /push/vapid-public-key` backend route that just returns
+`settings.vapid_public_key`. Reasoning — it's not a secret (every
+subscribing browser receives this exact value as `applicationServerKey`
+anyway), and fetching it from the one place it's already configured avoids
+keeping the same value duplicated and in sync across the root `.env` and a
+separate frontend env var.
 
 **`public/sw.js`** (new)
 Why: the Push API fundamentally requires a Service Worker — the browser
@@ -2019,34 +2061,188 @@ Plain-English steps:
 
 **`lib/push.ts`** (new)
 Plain-English steps:
-1. `async function enablePushNotifications()`: call
-   `Notification.requestPermission()` — if denied, stop and surface that to
-   the caller rather than silently retrying.
-2. `navigator.serviceWorker.register("/sw.js")`, then
+1. `isPushSupported()`: feature-check `"serviceWorker" in navigator &&
+   "PushManager" in window`.
+2. `registerServiceWorker()`: `navigator.serviceWorker.register("/sw.js")`.
+3. `subscribeToPush()`: fetch the public key from `GET
+   /push/vapid-public-key`, convert it from base64url to a `Uint8Array`
+   (browsers want the raw bytes, not the string), then
    `registration.pushManager.subscribe({ userVisibleOnly: true,
-   applicationServerKey: VAPID_PUBLIC_KEY })` — `userVisibleOnly: true` is
-   required by the Push API spec (a page can't silently receive pushes
-   without ever showing the user something).
-3. POST the resulting subscription (`subscription.toJSON()`) to
-   `/push/subscribe` via the existing `apiJson` helper.
+   applicationServerKey })` — `userVisibleOnly: true` is required by the
+   Push API spec. POST the resulting `subscription.toJSON()` (`{endpoint,
+   keys}`) to `/push/subscribe` via `apiJson`.
+4. `unsubscribeFromPush()`: read the current subscription, call its own
+   `.unsubscribe()`, then `DELETE /push/subscribe` with its `endpoint`.
+5. `getCurrentSubscription()`: `registration.pushManager.getSubscription()`
+   — used on mount to show the toggle's correct initial state.
 
-**`lib/config.ts`** (modify)
-- Add `VAPID_PUBLIC_KEY` read from a `NEXT_PUBLIC_...` env var — needs the
-  `NEXT_PUBLIC_` prefix because, unlike the backend's secret VAPID private
-  key, this value legitimately needs to reach client-side JS.
+**`components/NotificationToggle.tsx`** (new)
+Plain-English steps:
+- A button that reads "Enable notifications" or "Disable notifications"
+  depending on whether a subscription currently exists; calls
+  `subscribeToPush()`/`unsubscribeFromPush()` on click. Renders nothing if
+  `isPushSupported()` is false.
+- **Hydration gotcha hit here**: `isPushSupported()` reads browser-only
+  APIs, so computing it with plain `useState`+`useEffect` mismatches the
+  server's render (always "unsupported") against the client's first render
+  — the exact same trap `getCurrentUserId()` hit in `lib/auth.ts` (see Step
+  7's notes). Fixed with the same `useSyncExternalStore(subscribe,
+  isPushSupported, () => false)` pattern. Also caught by
+  `eslint-plugin-react-hooks`: an earlier version called `setState`
+  synchronously inside the effect body, which the stricter lint rule flags
+  even though it "worked" — moving that one piece of state to
+  `useSyncExternalStore` fixed both the hydration risk and the lint error at
+  once.
 
 **`app/chat/page.tsx`** (modify)
-Plain-English flow:
-- Add a small "Enable notifications" button/banner (skip rendering it
-  entirely if `Notification.permission === "granted"` already, or if the
-  Push API isn't supported in this browser at all) that calls
-  `enablePushNotifications()` from `lib/push.ts` on click.
+- Render `<NotificationToggle />` next to the existing "Log out" button.
 
-**Checkpoint**: click "Enable notifications," grant the browser permission
-prompt, confirm a `push_subscriptions` row appears for your user. Close the
-tab (or just the specific conversation — remember Step 14's known
-limitation: any open tab counts as "connected," so fully close the app to
-test this) and have another user send you a message — confirm a real OS-level
-notification appears, and clicking it opens the right conversation. Reopen
-the tab/app and send another message from the other side — confirm this
-time NO push fires, since you're connected again and get it live instead.
+> **Verification, actually run in a real browser** (via the Chrome
+> extension, using a real logged-in session): clicked "Enable
+> notifications," granted the real OS permission prompt, confirmed a REAL
+> FCM subscription (`endpoint` starting `fcm.googleapis.com/fcm/send/...`)
+> landed in `push_subscriptions` — not a mock. With that tab sitting on the
+> chat list page (no WebSocket open for any conversation, i.e. genuinely
+> "offline" per Step 14's definition), sent a message from another user —
+> **a real OS-level notification appeared on screen**, confirmed by direct
+> observation. Opened the conversation (WebSocket connects) and sent a
+> follow-up message — it arrived live with no second notification, and the
+> backend logs confirmed no `push_subscriptions` query even ran. Clicked
+> "Disable notifications" — the row was deleted immediately. No console
+> errors throughout.
+
+---
+
+## Step 16 — Backend: AI chatbot (Ollama, standalone) ✅ Done
+
+**Not Phase 3's RAG bot.** `PLAN.md`'s Phase 3 envisions the AI as a RAG bot
+*participant* — a special `user` row addable to any conversation, backed by
+pgvector + Celery document ingestion, triggered by @mention, answering with
+cited sources. This is a separate, much simpler feature built alongside
+that unfinished roadmap item: a standalone "Chat with AI" page, direct LLM
+chat with no retrieval, no participant model, no persistence. Full design
+rationale lives in `AI_CHATBOT_PLAN.md`; requirements in
+`AI_CHATBOT_USER_STORIES.md`; file-by-file steps in
+`AI_CHATBOT_IMPLEMENTATION_STEPS.md`. This entry just logs what actually
+happened building it.
+
+**Create/modify:**
+```
+docker-compose.yml                (modify — ollama-chat-app service + ollama_data volume)
+.env                               (modify — OLLAMA_BASE_URL)
+backend/requirements.txt           (modify — add httpx)
+backend/app/
+├── core/
+│   └── config.py                  (modify — ollama_base_url setting)
+├── schemas/
+│   └── ai_chat.py                 (new — ChatMessage/AiChatRequest/AiChatResponse)
+├── services/
+│   └── ollama.py                  (new — send_chat_message())
+├── api/
+│   └── routes/
+│       └── ai_chat.py             (new — POST /ai/chat)
+└── main.py                        (modify — register ai_chat.router)
+```
+
+**One-time manual setup**: `docker compose exec ollama-chat-app ollama pull
+<model>` once the container exists — downloads into the `ollama_data` named
+volume, survives `docker compose down` (not `-v`).
+
+> **Real bug hit, not a code bug — an infra limit**: the original plan was
+> `llama3` (8B). On this machine, Docker Desktop's VM only has **3.8GB total
+> RAM** allocated — nowhere near the ~8GB `llama3` wants to load. The
+> `llama-server` process got OOM-killed mid-load every time
+> (`"llama-server process has terminated: signal: killed"` in the Ollama
+> container's own logs, confirmed by calling its `/api/chat` directly from
+> inside the backend container before suspecting the app code at all — same
+> "isolate which layer is actually broken" instinct as Step 12's S3
+> debugging). Fixed by switching to `llama3.2:1b` (~1.3GB) instead, which
+> fits comfortably in the available memory shared across all 5 containers.
+> The `services/ollama.py` model string is hardcoded to `"llama3.2:1b"` —
+> change it there (and re-pull) if this ever moves to a machine with more
+> RAM and `llama3` proper is wanted back.
+
+**`backend/app/schemas/ai_chat.py`** (new)
+- `ChatMessage{role: str, content: str}` — mirrors Ollama's own `/api/chat`
+  message shape exactly, same "mirror the external API" reasoning as
+  `PushSubscriptionRequest` mirroring the browser's `toJSON()`.
+- `AiChatRequest{messages: list[ChatMessage]}` — the ENTIRE conversation so
+  far, since nothing is persisted server-side.
+- `AiChatResponse{reply: str}`.
+
+**`backend/app/services/ollama.py`** (new)
+- `async def send_chat_message(messages: list[dict]) -> str`: one
+  `httpx.AsyncClient` POST to `{settings.ollama_base_url}/api/chat` with
+  `{"model": "llama3.2:1b", "messages": messages, "stream": False}`, a
+  generous 120s timeout (CPU inference is slow), returns
+  `data["message"]["content"]`. Lets `httpx.HTTPError` propagate
+  uncaught — the route layer decides how to translate it, not this
+  function (a deliberately different split from `services/push.py`, which
+  does its own per-subscription error handling, because that one has a
+  loop of independent sends to protect and this one doesn't).
+
+**`backend/app/api/routes/ai_chat.py`** (new)
+- `POST /ai/chat`, behind `get_current_user` — the full authorization bar,
+  no conversation/participant check needed since this touches no
+  `Conversation`/`Participant` rows at all.
+- Converts `payload.messages` to plain dicts, calls `send_chat_message`,
+  catches `httpx.HTTPError` → `HTTPException(502, "AI service is currently
+  unavailable")` so a down/unreachable Ollama container never surfaces as an
+  unhandled traceback.
+
+> **Verification, actually run against the live stack**: `curl`'d Ollama's
+> `/api/chat` directly before writing any route code, confirming the engine
+> itself worked — caught the OOM issue right here, before it could be
+> mistaken for an app bug. `POST /ai/chat` with no token → `401` before any
+> Ollama call. Real authenticated request → a real `llama3.2:1b`-generated
+> reply (not an echo) — e.g. asking "what is 2+2" came back "The answer is
+> 4." Stopped the `ollama-chat-app` container and hit the route again →
+> clean `502`, no traceback, confirmed via container logs. Restarted it and
+> re-tested successfully.
+
+---
+
+## Step 17 — Frontend: AI chatbot (Ollama, standalone) ✅ Done
+
+**Create/modify inside `frontend/`:**
+```
+app/ai-chat/page.tsx              (new — standalone chat page)
+app/chat/page.tsx                 (modify — "Chat with AI" button)
+```
+
+**`app/ai-chat/page.tsx`** (new)
+Plain-English steps:
+1. Same auth guard as `app/chat/page.tsx`: redirect to `/login` if
+   `!isAuthenticated()`.
+2. Local state only, nothing persisted: `messages: {role, content}[]`,
+   `input`, `sending` (drives a "thinking" indicator and disables the
+   input/button — there's no request queue here unlike `chat.py`'s
+   WebSocket loop, so disabling is the simplest way to prevent a second
+   request racing the first), `error`.
+3. On send: build `nextMessages = [...messages, newUserMessage]`, `POST
+   /ai/chat` with the **entire** `nextMessages` array (not just the new
+   one) — this is the whole mechanism behind the AI "remembering" earlier
+   turns, since the backend itself holds no memory between requests.
+   Append the assistant's reply to state on success.
+4. Deliberately no history fetch on mount — a fresh page load always starts
+   at `messages: []`, by design (ephemeral, no DB table for this feature at
+   all).
+5. A dedicated, simpler message-bubble UI rather than reusing
+   `MessageList`/`MessageInput` — those are built around
+   `Message`/`Attachment`/read-receipt types this feature doesn't have.
+
+**`app/chat/page.tsx`** (modify)
+- Add a "Chat with AI" button next to "+ New chat"/"+ New group", same
+  style, `onClick={() => router.push("/ai-chat")}`.
+
+> **Verification, actually run in the browser**: clicked "Chat with AI,"
+> page loaded with an empty box. Asked "What is the capital of France?" →
+> saw the "AI is thinking…" state with input disabled → got back a real
+> model reply ("The capital of France is Paris."). Sent a follow-up ("What
+> country did you just mention?") that only makes sense with context → the
+> reply referenced France, confirming the full-history-resend mechanism
+> actually works, not just in theory. Refreshed the page → chat box was
+> empty again (expected — ephemeral by design, not a bug). Confirmed zero
+> new rows in `conversations`/`messages`/`participants` after the whole
+> session — full isolation from the existing chat system, as planned. No
+> console errors.

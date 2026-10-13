@@ -139,6 +139,13 @@ export default function ChatListPage() {
             >
               + New group
             </button>
+            <button
+              type="button"
+              onClick={() => router.push("/ai-chat")}
+              className="flex-1 rounded-full border px-4 py-2 text-sm"
+            >
+              Chat with AI
+            </button>
           </div>
         )}
 

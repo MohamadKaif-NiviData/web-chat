@@ -39,7 +39,14 @@ services:
         - backend-chat-app
       ports:
         - "3000:3000"
+    ollama-chat-app:
+      image: ollama/ollama
+      volumes:
+        - ollama_data:/root/.ollama
+      ports:
+        - "11434:11434"
 
 
 volumes:
     postgres_data:
+    ollama_data:

@@ -8,6 +8,8 @@ from app.db.session import get_db
 from app.models.user import User
 
 oauth2 = OAuth2PasswordBearer(tokenUrl="auth/login")
+
+
 async def get_current_user(token: str= Depends(oauth2), db: AsyncSession= Depends(get_db))->User:
     try:
         user_id = decode_token(token=token)
@@ -17,5 +19,4 @@ async def get_current_user(token: str= Depends(oauth2), db: AsyncSession= Depend
             raise HTTPException(status_code=401, detail="Invalid or expired token")
         return user
     except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")    
-    
+        raise HTTPException(status_code=401, detail="Invalid or expired token")

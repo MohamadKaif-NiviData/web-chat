@@ -34,3 +34,6 @@ boto3==1.28.44
 # an INSTANCE, which newer `cryptography` releases reject outright
 # (TypeError: curve must be an EllipticCurve instance) — fixed upstream by 2.5.0.
 pywebpush==2.5.0
+
+
+httpx==0.24.0
