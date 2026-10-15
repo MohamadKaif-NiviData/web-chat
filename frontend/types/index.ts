@@ -21,6 +21,7 @@ export interface Message {
   created_at: string;
   read_by: number[];
   attachment?: Attachment | null;
+  edited_at?: string | null;
 }
 
 export interface MessagePage {
@@ -62,4 +63,21 @@ export type ReadEvent = {
   type: "read";
   message_ids: number[];
   user_id: number;
+};
+
+export type MessageEditedEvent = {
+  type: "message_edited";
+  message_id: number;
+  content: string;
+  edited_at: string;
+};
+
+export type MessageDeletedEvent = {
+  type: "message_deleted";
+  message_id: number;
+};
+
+export type MessageHiddenEvent = {
+  type: "message_hidden";
+  message_id: number;
 };

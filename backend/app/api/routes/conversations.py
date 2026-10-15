@@ -1,22 +1,26 @@
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from app.models.attachment import Attachment
 from fastapi import APIRouter, HTTPException, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, delete
 from app.db.session import get_db
 from app.api.deps import get_current_user
 from app.models.user import User
 from app.models.conversation import Conversation, Participant
 from app.models.message import Message
 from app.models.message_read import MessageRead
-from app.schemas.message import MessageResponse, MessagePage, MarkReadRequest
+from app.models.hidden_message import HiddenMessage
+from app.schemas.message import MessageResponse, MessagePage, MarkReadRequest, MessageEditRequest
 from app.schemas.conversation import ConversationResponse, ConversationSummary, ParticipantSummary, GroupCreateRequest
 from app.schemas.attachment import AttachmentResponse
-from app.core.config import presigned_get_url, settings
+from app.core.config import presigned_get_url, delete_object, settings
 from app.services.presence import is_online
 from app.services.connection_manager import manager
+
+EDIT_WINDOW = timedelta(minutes=15)
+DELETE_WINDOW = timedelta(hours=1)
 
 router = APIRouter()
 
@@ -102,6 +106,10 @@ async def list_conversations(current_user: User = Depends(get_current_user), db:
     )
     conversations = {conv.id: conv for conv in conversation_result.scalars().all()}
 
+    # A message this user deleted "for me" must never resurface as a chat
+    # list preview, even though every other participant still sees it fine.
+    hidden_message_ids = select(HiddenMessage.message_id).where(HiddenMessage.user_id == current_user.id)
+
     summaries = []
     for conversation_id in conversation_ids:
         other_result = await db.execute(
@@ -121,7 +129,7 @@ async def list_conversations(current_user: User = Depends(get_current_user), db:
 
         last_message_result = await db.execute(
             select(Message)
-            .where(Message.conversation_id == conversation_id)
+            .where(Message.conversation_id == conversation_id, Message.id.notin_(hidden_message_ids))
             .order_by(Message.id.desc())
             .limit(1)
         )
@@ -194,8 +202,12 @@ async def get_message_history(conversation_id: int, cursor: int | None = Query(N
     if not participant:
         raise HTTPException(status_code=403, detail="Not authorized to view this conversation")
 
-    # Fetch messages
-    query = select(Message).where(Message.conversation_id == conversation_id)
+    # Fetch messages — excluding anything this user has deleted "for me"
+    hidden_message_ids = select(HiddenMessage.message_id).where(HiddenMessage.user_id == current_user.id)
+    query = select(Message).where(
+        Message.conversation_id == conversation_id,
+        Message.id.notin_(hidden_message_ids),
+    )
     if cursor:
         query = query.where(Message.id < cursor)
     query = query.order_by(Message.id.desc()).limit(limit + 1)
@@ -250,11 +262,148 @@ async def get_message_history(conversation_id: int, cursor: int | None = Query(N
             created_at=m.created_at,
             read_by=read_by_map.get(m.id, []),
             attachment=build_attachment(m),
+            edited_at=m.edited_at,
         )
         for m in messages
     ]
 
     return MessagePage(messages=message_responses, next_cursor=next_cursor)
+
+
+@router.patch("/{conversation_id}/messages/{message_id}", response_model=MessageResponse)
+async def edit_message(
+    conversation_id: int,
+    message_id: int,
+    payload: MessageEditRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Message).where(Message.id == message_id, Message.conversation_id == conversation_id)
+    )
+    message = result.scalar_one_or_none()
+    if not message:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    if message.sender_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to edit this message")
+
+    if datetime.now(timezone.utc) - message.created_at > EDIT_WINDOW:
+        raise HTTPException(status_code=403, detail="Edit window has expired")
+
+    message.content = payload.content
+    message.edited_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(message)
+
+    other_result = await db.execute(
+        select(Participant.user_id).where(
+            Participant.conversation_id == conversation_id,
+            Participant.user_id != current_user.id,
+        )
+    )
+    other_user_ids = [row[0] for row in other_result.all()]
+    for uid in [*other_user_ids, current_user.id]:
+        await manager.send_to_user(
+            uid,
+            {
+                "type": "message_edited",
+                "message_id": message.id,
+                "content": message.content,
+                "edited_at": message.edited_at.isoformat(),
+            },
+        )
+
+    return MessageResponse.model_validate(message)
+
+
+@router.delete("/{conversation_id}/messages/{message_id}")
+async def delete_message_for_everyone(
+    conversation_id: int,
+    message_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Message).where(Message.id == message_id, Message.conversation_id == conversation_id)
+    )
+    message = result.scalar_one_or_none()
+    if not message:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    if message.sender_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to delete this message")
+
+    if datetime.now(timezone.utc) - message.created_at > DELETE_WINDOW:
+        raise HTTPException(status_code=403, detail="Delete window has expired")
+
+    # Delete order matters: both message_reads and attachments reference
+    # messages.id with no cascade configured — deleting the message first
+    # raises a real ForeignKeyViolation (hit once already during manual test
+    # cleanup after the push notifications work).
+    await db.execute(delete(HiddenMessage).where(HiddenMessage.message_id == message_id))
+    await db.execute(delete(MessageRead).where(MessageRead.message_id == message_id))
+
+    attachment_result = await db.execute(select(Attachment).where(Attachment.message_id == message_id))
+    attachment = attachment_result.scalar_one_or_none()
+    if attachment:
+        delete_object(settings.s3_bucket_name, attachment.object_key)
+        await db.delete(attachment)
+
+    await db.delete(message)
+    await db.commit()
+
+    other_result = await db.execute(
+        select(Participant.user_id).where(
+            Participant.conversation_id == conversation_id,
+            Participant.user_id != current_user.id,
+        )
+    )
+    other_user_ids = [row[0] for row in other_result.all()]
+    for uid in [*other_user_ids, current_user.id]:
+        await manager.send_to_user(uid, {"type": "message_deleted", "message_id": message_id})
+
+    return {"status": "deleted"}
+
+
+@router.post("/{conversation_id}/messages/{message_id}/hide")
+async def hide_message_for_me(
+    conversation_id: int,
+    message_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Message).where(Message.id == message_id, Message.conversation_id == conversation_id)
+    )
+    message = result.scalar_one_or_none()
+    if not message:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    # Any participant may hide any message — never trust the URL alone, same
+    # authorization check every other route here already makes.
+    participant_result = await db.execute(
+        select(Participant).where(
+            Participant.conversation_id == conversation_id,
+            Participant.user_id == current_user.id,
+        )
+    )
+    if not participant_result.scalar_one_or_none():
+        raise HTTPException(status_code=403, detail="Not authorized to hide messages in this conversation")
+
+    existing_result = await db.execute(
+        select(HiddenMessage).where(
+            HiddenMessage.message_id == message_id,
+            HiddenMessage.user_id == current_user.id,
+        )
+    )
+    if not existing_result.scalar_one_or_none():
+        db.add(HiddenMessage(message_id=message_id, user_id=current_user.id))
+        await db.commit()
+
+    await manager.send_to_user(current_user.id, {"type": "message_hidden", "message_id": message_id})
+
+    return {"status": "hidden"}
 
 
 # Why: the frontend's conversation page only knows the conversation_id from

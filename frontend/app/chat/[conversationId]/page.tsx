@@ -41,6 +41,7 @@ export default function ConversationPage() {
   const [nextCursor, setNextCursor] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [editingMessage, setEditingMessage] = useState<Message | null>(null);
   const [typingUserIds, setTypingUserIds] = useState<Set<number>>(new Set());
   const typingTimeoutsRef = useRef<Map<number, ReturnType<typeof setTimeout>>>(new Map());
   // FIFO queue of this tab's own not-yet-confirmed placeholder ids. chat.py
@@ -140,6 +141,17 @@ export default function ConversationPage() {
         }, TYPING_TIMEOUT_MS),
       );
     },
+    onMessageEdited: (messageId, content, editedAt) => {
+      setMessages((prev) =>
+        prev.map((m) => (m.id === messageId ? { ...m, content, edited_at: editedAt } : m)),
+      );
+    },
+    onMessageDeleted: (messageId) => {
+      setMessages((prev) => prev.filter((m) => m.id !== messageId));
+    },
+    onMessageHidden: (messageId) => {
+      setMessages((prev) => prev.filter((m) => m.id !== messageId));
+    },
   });
 
   useEffect(() => {
@@ -205,6 +217,40 @@ export default function ConversationPage() {
     }
   }
 
+  // Local message state is updated from the WebSocket echo (onMessageEdited
+  // above), not directly from this response — keeps exactly one code path
+  // responsible for applying the change, same reconciliation-via-echo
+  // pattern already used for sending a message.
+  async function handleSaveEdit(content: string) {
+    if (!editingMessage) return;
+    try {
+      await apiJson(`/conversations/${conversationId}/messages/${editingMessage.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ content }),
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to edit message");
+    } finally {
+      setEditingMessage(null);
+    }
+  }
+
+  async function handleDeleteForEveryone(messageId: number) {
+    try {
+      await apiJson(`/conversations/${conversationId}/messages/${messageId}`, { method: "DELETE" });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to delete message");
+    }
+  }
+
+  async function handleDeleteForMe(messageId: number) {
+    try {
+      await apiJson(`/conversations/${conversationId}/messages/${messageId}/hide`, { method: "POST" });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to hide message");
+    }
+  }
+
   if (currentUserId === null) return null;
 
   return (
@@ -230,14 +276,21 @@ export default function ConversationPage() {
           typingLabel={buildTypingLabel(typingUserIds, participantsById)}
           onLoadOlder={handleLoadOlder}
           hasMore={nextCursor !== null}
+          onEdit={setEditingMessage}
+          onDeleteForEveryone={handleDeleteForEveryone}
+          onDeleteForMe={handleDeleteForMe}
         />
       )}
 
       <MessageInput
+        key={editingMessage?.id ?? "compose"}
         conversationId={conversationId}
         onSend={handleSend}
         onSendFile={handleSendFile}
         onTyping={sendTyping}
+        editingContent={editingMessage?.content ?? null}
+        onSaveEdit={handleSaveEdit}
+        onCancelEdit={() => setEditingMessage(null)}
       />
     </div>
   );

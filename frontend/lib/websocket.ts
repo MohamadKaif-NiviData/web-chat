@@ -4,7 +4,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { WS_BASE_URL } from "./config";
 import { getAccessToken } from "./auth";
 import type { UploadedAttachment } from "./uploads";
-import type { Message, ReadEvent, TypingEvent } from "@/types";
+import type {
+  Message,
+  ReadEvent,
+  TypingEvent,
+  MessageEditedEvent,
+  MessageDeletedEvent,
+  MessageHiddenEvent,
+} from "@/types";
 
 const TYPING_THROTTLE_MS = 2000;
 
@@ -12,6 +19,9 @@ interface ChatSocketHandlers {
   onMessage: (message: Message) => void;
   onTyping: (userId: number) => void;
   onRead: (messageIds: number[], userId: number) => void;
+  onMessageEdited?: (messageId: number, content: string, editedAt: string) => void;
+  onMessageDeleted?: (messageId: number) => void;
+  onMessageHidden?: (messageId: number) => void;
 }
 
 export function useChatSocket(conversationId: number | null, handlers: ChatSocketHandlers) {
@@ -35,12 +45,25 @@ export function useChatSocket(conversationId: number | null, handlers: ChatSocke
     socket.onopen = () => setConnected(true);
     socket.onclose = () => setConnected(false);
     socket.onmessage = (event) => {
-      const data = JSON.parse(event.data) as Message | TypingEvent | ReadEvent;
+      const data = JSON.parse(event.data) as
+        | Message
+        | TypingEvent
+        | ReadEvent
+        | MessageEditedEvent
+        | MessageDeletedEvent
+        | MessageHiddenEvent;
       if (data.type === "typing") {
         handlersRef.current.onTyping((data as TypingEvent).user_id);
       } else if (data.type === "read") {
         const readEvent = data as ReadEvent;
         handlersRef.current.onRead(readEvent.message_ids, readEvent.user_id);
+      } else if (data.type === "message_edited") {
+        const editedEvent = data as MessageEditedEvent;
+        handlersRef.current.onMessageEdited?.(editedEvent.message_id, editedEvent.content, editedEvent.edited_at);
+      } else if (data.type === "message_deleted") {
+        handlersRef.current.onMessageDeleted?.((data as MessageDeletedEvent).message_id);
+      } else if (data.type === "message_hidden") {
+        handlersRef.current.onMessageHidden?.((data as MessageHiddenEvent).message_id);
       } else {
         handlersRef.current.onMessage(data as Message);
       }

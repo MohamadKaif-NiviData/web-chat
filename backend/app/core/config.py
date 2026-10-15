@@ -62,3 +62,12 @@ def presigned_get_url(bucket_name: str, object_name: str, expiration: int = 3600
     except Exception as e:
         print(f"Error generating presigned URL: {e}")
         return None
+
+
+def delete_object(bucket_name: str, object_name: str) -> bool:
+    try:
+        s3_client.delete_object(Bucket=bucket_name, Key=object_name)
+        return True
+    except Exception as e:
+        print(f"Error deleting object: {e}")
+        return False

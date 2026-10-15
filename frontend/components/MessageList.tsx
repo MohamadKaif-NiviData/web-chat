@@ -12,6 +12,9 @@ interface MessageListProps {
   typingLabel: string | null;
   onLoadOlder: () => void;
   hasMore: boolean;
+  onEdit: (message: Message) => void;
+  onDeleteForEveryone: (messageId: number) => void;
+  onDeleteForMe: (messageId: number) => void;
 }
 
 export function MessageList({
@@ -23,6 +26,9 @@ export function MessageList({
   typingLabel,
   onLoadOlder,
   hasMore,
+  onEdit,
+  onDeleteForEveryone,
+  onDeleteForMe,
 }: MessageListProps) {
   const bottomRef = useRef<HTMLDivElement>(null);
   const [expandedImage, setExpandedImage] = useState<{ url: string; alt: string } | null>(null);
@@ -95,7 +101,26 @@ export function MessageList({
                   ))}
                 {message.content && <p className={attachment ? "mt-1" : ""}>{message.content}</p>}
               </div>
-              {seenByEveryone && <span className="mt-0.5 px-1 text-xs italic text-zinc-500">Seen</span>}
+              <div className="mt-0.5 flex items-center gap-2 px-1 text-xs text-zinc-500">
+                {message.edited_at && <span className="italic">(edited)</span>}
+                {seenByEveryone && <span className="italic">Seen</span>}
+                {isMine && (
+                  <>
+                    <button onClick={() => onEdit(message)} className="underline hover:text-zinc-900 dark:hover:text-zinc-100">
+                      Edit
+                    </button>
+                    <button
+                      onClick={() => onDeleteForEveryone(message.id)}
+                      className="underline hover:text-zinc-900 dark:hover:text-zinc-100"
+                    >
+                      Delete for everyone
+                    </button>
+                  </>
+                )}
+                <button onClick={() => onDeleteForMe(message.id)} className="underline hover:text-zinc-900 dark:hover:text-zinc-100">
+                  Delete for me
+                </button>
+              </div>
             </div>
           );
         })}

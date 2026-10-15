@@ -12,6 +12,7 @@ class MessageResponse(BaseModel):
     read_by: list[int] = []
     model_config = ConfigDict(from_attributes=True)
     attachment: AttachmentResponse | None = None
+    edited_at: datetime | None = None
 
 class MessagePage(BaseModel):
     messages: list[MessageResponse]
@@ -19,3 +20,6 @@ class MessagePage(BaseModel):
 
 class MarkReadRequest(BaseModel):
     message_ids: list[int]
+
+class MessageEditRequest(BaseModel):
+    content: str
