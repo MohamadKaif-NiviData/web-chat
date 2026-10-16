@@ -15,6 +15,7 @@ interface MessageListProps {
   onEdit: (message: Message) => void;
   onDeleteForEveryone: (messageId: number) => void;
   onDeleteForMe: (messageId: number) => void;
+  highlightMessageId?: number | null;
 }
 
 export function MessageList({
@@ -29,13 +30,26 @@ export function MessageList({
   onEdit,
   onDeleteForEveryone,
   onDeleteForMe,
+  highlightMessageId,
 }: MessageListProps) {
   const bottomRef = useRef<HTMLDivElement>(null);
+  const messageRefs = useRef<Map<number, HTMLDivElement>>(new Map());
   const [expandedImage, setExpandedImage] = useState<{ url: string; alt: string } | null>(null);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ block: "end" });
   }, [messages.length]);
+
+  // A separate effect, keyed only on highlightMessageId (not messages.length)
+  // — jumping into history from a search result needs to override the
+  // default scroll-to-bottom above exactly once. It must NOT re-fire and
+  // re-scroll when the highlight later clears back to null (page.tsx fades
+  // it out after a few seconds), so a cleared highlight is a deliberate
+  // no-op here, not "scroll to nothing."
+  useEffect(() => {
+    if (highlightMessageId == null) return;
+    messageRefs.current.get(highlightMessageId)?.scrollIntoView({ block: "center" });
+  }, [highlightMessageId]);
 
   // Escape closes the lightbox the same way clicking the backdrop does.
   useEffect(() => {
@@ -71,7 +85,14 @@ export function MessageList({
             otherParticipantIds.every((id) => message.read_by.includes(id));
           const attachment = message.attachment;
           return (
-            <div key={message.id} className={`flex flex-col ${isMine ? "items-end" : "items-start"}`}>
+            <div
+              key={message.id}
+              ref={(el) => {
+                if (el) messageRefs.current.set(message.id, el);
+                else messageRefs.current.delete(message.id);
+              }}
+              className={`flex flex-col ${isMine ? "items-end" : "items-start"}`}
+            >
               {isGroup && !isMine && (
                 <span className="mb-0.5 px-1 text-xs text-zinc-500">
                   {participantsById[message.sender_id] ?? "Unknown"}
@@ -80,7 +101,7 @@ export function MessageList({
               <div
                 className={`max-w-xs rounded-2xl px-4 py-2 text-sm ${
                   isMine ? "bg-foreground text-background" : "bg-zinc-100 dark:bg-zinc-800"
-                }`}
+                } ${message.id === highlightMessageId ? "ring-2 ring-amber-400" : ""}`}
               >
                 {attachment &&
                   (attachment.mime_type.startsWith("image/") ? (

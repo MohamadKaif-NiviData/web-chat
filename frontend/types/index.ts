@@ -81,3 +81,20 @@ export type MessageHiddenEvent = {
   type: "message_hidden";
   message_id: number;
 };
+
+export interface MessageSearchResult {
+  message_id: number;
+  conversation_id: number;
+  conversation_name: string;
+  is_group: boolean;
+  sender_id: number;
+  sender_display_name: string;
+  content: string;
+  created_at: string;
+  edited_at?: string | null;
+}
+
+export interface MessageSearchPage {
+  results: MessageSearchResult[];
+  next_cursor: number | null;
+}

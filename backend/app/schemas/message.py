@@ -23,3 +23,18 @@ class MarkReadRequest(BaseModel):
 
 class MessageEditRequest(BaseModel):
     content: str
+
+class MessageSearchResult(BaseModel):
+    message_id: int
+    conversation_id: int
+    conversation_name: str
+    is_group: bool
+    sender_id: int
+    sender_display_name: str
+    content: str
+    created_at: datetime
+    edited_at: datetime | None = None
+
+class MessageSearchPage(BaseModel):
+    results: list[MessageSearchResult]
+    next_cursor: int | None
