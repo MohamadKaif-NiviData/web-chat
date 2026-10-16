@@ -11,6 +11,7 @@ import { MessageInput } from "@/components/MessageInput";
 import type { ConversationSummary, Message, MessagePage } from "@/types";
 
 const TYPING_TIMEOUT_MS = 3000;
+const HIGHLIGHT_TIMEOUT_MS = 3000;
 
 function buildTypingLabel(typingUserIds: Set<number>, participantsById: Record<number, string>): string | null {
   if (typingUserIds.size === 0) return null;
@@ -42,6 +43,7 @@ export default function ConversationPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [editingMessage, setEditingMessage] = useState<Message | null>(null);
+  const [highlightMessageId, setHighlightMessageId] = useState<number | null>(null);
   const [typingUserIds, setTypingUserIds] = useState<Set<number>>(new Set());
   const typingTimeoutsRef = useRef<Map<number, ReturnType<typeof setTimeout>>>(new Map());
   // FIFO queue of this tab's own not-yet-confirmed placeholder ids. chat.py
@@ -52,6 +54,7 @@ export default function ConversationPage() {
   // a single WebSocket connection processes/echoes messages in the order
   // they were sent.
   const pendingSentIdsRef = useRef<number[]>([]);
+  const highlightTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const participantsById = useMemo(() => {
     const map: Record<number, string> = {};
@@ -81,9 +84,19 @@ export default function ConversationPage() {
       router.replace("/login");
       return;
     }
+    // Read directly from the URL rather than useSearchParams — this is a
+    // "use client" page component with no Suspense boundary above it, and
+    // useSearchParams requires one in production builds. A plain read here
+    // is safe because this effect already only ever runs client-side.
+    const aroundParam = new URLSearchParams(window.location.search).get("around");
+    const aroundId = aroundParam ? Number(aroundParam) : null;
+    const messagesUrl = aroundId
+      ? `/conversations/${conversationId}/messages?around=${aroundId}`
+      : `/conversations/${conversationId}/messages`;
+
     Promise.all([
       apiJson<ConversationSummary>(`/conversations/${conversationId}`),
-      apiJson<MessagePage>(`/conversations/${conversationId}/messages`),
+      apiJson<MessagePage>(messagesUrl),
     ])
       .then(([conversationDetail, page]) => {
         setConversation(conversationDetail);
@@ -97,11 +110,22 @@ export default function ConversationPage() {
         // settles it via useSyncExternalStore.
         const myId = getCurrentUserId();
         markRead(loaded.filter((m) => m.sender_id !== myId).map((m) => m.id));
+
+        if (aroundId !== null) {
+          setHighlightMessageId(aroundId);
+          highlightTimeoutRef.current = setTimeout(() => setHighlightMessageId(null), HIGHLIGHT_TIMEOUT_MS);
+        }
       })
       .catch((err) => setError(err instanceof Error ? err.message : "Failed to load conversation"))
       .finally(() => setLoading(false));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [conversationId, router]);
+
+  useEffect(() => {
+    return () => {
+      if (highlightTimeoutRef.current) clearTimeout(highlightTimeoutRef.current);
+    };
+  }, []);
 
   const { sendMessage, sendFileMessage, sendTyping } = useChatSocket(conversationId, {
     onMessage: (message) => {
@@ -279,6 +303,7 @@ export default function ConversationPage() {
           onEdit={setEditingMessage}
           onDeleteForEveryone={handleDeleteForEveryone}
           onDeleteForMe={handleDeleteForMe}
+          highlightMessageId={highlightMessageId}
         />
       )}
 

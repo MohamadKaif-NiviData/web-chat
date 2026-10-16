@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { isAuthenticated, logout } from "@/lib/auth";
 import { apiJson } from "@/lib/api";
 import { ConversationList } from "@/components/ConversationList";
+import { MessageSearch } from "@/components/MessageSearch";
 import { NotificationToggle } from "@/components/NotificationToggle";
 import type { ConversationSummary, ConversationCreateResponse, User } from "@/types";
 
@@ -241,6 +242,8 @@ export default function ChatListPage() {
           </div>
         )}
       </div>
+
+      <MessageSearch />
 
       {error && <p className="px-4 py-2 text-sm text-red-600">{error}</p>}
 

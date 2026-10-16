@@ -12,7 +12,14 @@ from app.models.conversation import Conversation, Participant
 from app.models.message import Message
 from app.models.message_read import MessageRead
 from app.models.hidden_message import HiddenMessage
-from app.schemas.message import MessageResponse, MessagePage, MarkReadRequest, MessageEditRequest
+from app.schemas.message import (
+    MessageResponse,
+    MessagePage,
+    MarkReadRequest,
+    MessageEditRequest,
+    MessageSearchResult,
+    MessageSearchPage,
+)
 from app.schemas.conversation import ConversationResponse, ConversationSummary, ParticipantSummary, GroupCreateRequest
 from app.schemas.attachment import AttachmentResponse
 from app.core.config import presigned_get_url, delete_object, settings
@@ -21,8 +28,19 @@ from app.services.connection_manager import manager
 
 EDIT_WINDOW = timedelta(minutes=15)
 DELETE_WINDOW = timedelta(hours=1)
+MIN_SEARCH_QUERY_LENGTH = 2
 
 router = APIRouter()
+
+
+def _escape_ilike(term: str) -> str:
+    # `%` and `_` are ILIKE wildcards, not literal characters — without this,
+    # searching for a literal "%" (e.g. "50% off") would be silently
+    # reinterpreted as "zero or more of anything". Escaping them (and the
+    # escape character itself) before wrapping in our own wildcards is what
+    # makes the search term's special characters behave as the user typed
+    # them, not as pattern syntax.
+    return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 # Why: every conversation-shaped read/write already lives in this file;
@@ -154,6 +172,109 @@ async def list_conversations(current_user: User = Depends(get_current_user), db:
     summaries.sort(key=lambda s: s.last_message.created_at if s.last_message else epoch, reverse=True)
     return summaries
 
+# Why: registered here — before `GET /{conversation_id}` further down — on
+# purpose. That route's path param has no explicit `:int` converter, so at
+# the routing layer `/search` is indistinguishable from `/{conversation_id}`;
+# whichever of the two is registered first wins the match, and only then
+# does FastAPI try (and fail) to parse "search" as an int. Declaring this
+# route earlier in the file is what makes `/search` actually reach this
+# function instead of 422-ing against get_conversation.
+@router.get("/search", response_model=MessageSearchPage)
+async def search_messages(
+    q: str = Query(...),
+    cursor: int | None = Query(None),
+    limit: int = Query(20),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    term = q.strip()
+    if len(term) < MIN_SEARCH_QUERY_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Search term must be at least {MIN_SEARCH_QUERY_LENGTH} characters",
+        )
+
+    # Authorization is implicit in the join, not a separate check: a message
+    # can only be matched if the requesting user is actually a participant
+    # of its conversation — never trust a client-supplied conversation scope.
+    hidden_message_ids = select(HiddenMessage.message_id).where(HiddenMessage.user_id == current_user.id)
+    pattern = f"%{_escape_ilike(term)}%"
+
+    query = (
+        select(Message)
+        .join(Participant, Participant.conversation_id == Message.conversation_id)
+        .where(
+            Participant.user_id == current_user.id,
+            Message.content.ilike(pattern, escape="\\"),
+            Message.id.notin_(hidden_message_ids),
+        )
+    )
+    if cursor:
+        query = query.where(Message.id < cursor)
+    query = query.order_by(Message.id.desc()).limit(limit + 1)
+
+    result = await db.execute(query)
+    messages = result.scalars().all()
+
+    next_cursor = None
+    if len(messages) > limit:
+        next_cursor = messages[limit - 1].id
+        messages = messages[:limit]
+
+    if not messages:
+        return MessageSearchPage(results=[], next_cursor=None)
+
+    # Batch-fetch everything needed to label each result (conversation name,
+    # sender) in a handful of queries total, not one per matched message —
+    # same N+1 trap avoided everywhere else in this file.
+    conversation_ids = {m.conversation_id for m in messages}
+    sender_ids = {m.sender_id for m in messages}
+
+    conversation_result = await db.execute(select(Conversation).where(Conversation.id.in_(conversation_ids)))
+    conversations = {c.id: c for c in conversation_result.scalars().all()}
+
+    other_participants_result = await db.execute(
+        select(Participant.conversation_id, User)
+        .join(User, User.id == Participant.user_id)
+        .where(
+            Participant.conversation_id.in_(conversation_ids),
+            Participant.user_id != current_user.id,
+        )
+    )
+    other_user_by_conversation: dict[int, User] = {}
+    for conv_id, user in other_participants_result.all():
+        other_user_by_conversation.setdefault(conv_id, user)
+
+    sender_result = await db.execute(select(User).where(User.id.in_(sender_ids)))
+    senders = {u.id: u for u in sender_result.scalars().all()}
+
+    results = []
+    for m in messages:
+        conversation = conversations.get(m.conversation_id)
+        if conversation is None:
+            continue
+        other_user = other_user_by_conversation.get(m.conversation_id)
+        conversation_name = (
+            conversation.name if conversation.is_group else (other_user.display_name if other_user else "")
+        )
+        sender = senders.get(m.sender_id)
+        results.append(
+            MessageSearchResult(
+                message_id=m.id,
+                conversation_id=m.conversation_id,
+                conversation_name=conversation_name,
+                is_group=conversation.is_group,
+                sender_id=m.sender_id,
+                sender_display_name=sender.display_name if sender else "Unknown",
+                content=m.content,
+                created_at=m.created_at,
+                edited_at=m.edited_at,
+            )
+        )
+
+    return MessageSearchPage(results=results, next_cursor=next_cursor)
+
+
 @router.post("/", response_model=ConversationResponse)
 async def create_or_get_conversation(other_user_id: int, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     # Check if a conversation already exists between the two users
@@ -191,7 +312,7 @@ async def create_or_get_conversation(other_user_id: int, current_user: User = De
 
 
 @router.get("/{conversation_id}/messages", response_model=MessagePage)
-async def get_message_history(conversation_id: int, cursor: int | None = Query(None), limit: int = Query(20), current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+async def get_message_history(conversation_id: int, cursor: int | None = Query(None), limit: int = Query(20), around: int | None = Query(None), current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     # Authorization check
     result = await db.execute(
         select(Participant)
@@ -204,21 +325,65 @@ async def get_message_history(conversation_id: int, cursor: int | None = Query(N
 
     # Fetch messages — excluding anything this user has deleted "for me"
     hidden_message_ids = select(HiddenMessage.message_id).where(HiddenMessage.user_id == current_user.id)
-    query = select(Message).where(
-        Message.conversation_id == conversation_id,
-        Message.id.notin_(hidden_message_ids),
-    )
-    if cursor:
-        query = query.where(Message.id < cursor)
-    query = query.order_by(Message.id.desc()).limit(limit + 1)
 
-    result = await db.execute(query)
-    messages = result.scalars().all()
+    if around is not None:
+        # A search result points at a message that could be arbitrarily deep
+        # in history — the normal "everything before cursor" query can only
+        # page backward from the newest end, so it can never land here
+        # directly. Instead fetch a window straddling the target id: some
+        # messages before it (inclusive, so the target itself is included)
+        # and some after, then let the existing cursor/"Load older" flow
+        # continue upward from the oldest message in that window exactly as
+        # it does today.
+        half = max(1, limit // 2)
+        older_query = (
+            select(Message)
+            .where(
+                Message.conversation_id == conversation_id,
+                Message.id.notin_(hidden_message_ids),
+                Message.id <= around,
+            )
+            .order_by(Message.id.desc())
+            .limit(half + 1)
+        )
+        older_result = await db.execute(older_query)
+        older_messages = older_result.scalars().all()
 
-    next_cursor = None
-    if len(messages) > limit:
-        next_cursor = messages[limit - 1].id
-        messages = messages[:limit]
+        next_cursor = None
+        if len(older_messages) > half:
+            next_cursor = older_messages[half - 1].id
+            older_messages = older_messages[:half]
+
+        newer_query = (
+            select(Message)
+            .where(
+                Message.conversation_id == conversation_id,
+                Message.id.notin_(hidden_message_ids),
+                Message.id > around,
+            )
+            .order_by(Message.id.asc())
+            .limit(half)
+        )
+        newer_result = await db.execute(newer_query)
+        newer_messages = list(reversed(newer_result.scalars().all()))
+
+        messages = newer_messages + older_messages
+    else:
+        query = select(Message).where(
+            Message.conversation_id == conversation_id,
+            Message.id.notin_(hidden_message_ids),
+        )
+        if cursor:
+            query = query.where(Message.id < cursor)
+        query = query.order_by(Message.id.desc()).limit(limit + 1)
+
+        result = await db.execute(query)
+        messages = result.scalars().all()
+
+        next_cursor = None
+        if len(messages) > limit:
+            next_cursor = messages[limit - 1].id
+            messages = messages[:limit]
 
     # Batch-fetch read state for this page — one query for all messages,
     # not one per message (same N+1 trap avoided everywhere else here).
