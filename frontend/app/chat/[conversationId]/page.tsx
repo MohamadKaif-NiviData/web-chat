@@ -8,6 +8,7 @@ import { useChatSocket } from "@/lib/websocket";
 import type { UploadedAttachment } from "@/lib/uploads";
 import { MessageList } from "@/components/MessageList";
 import { MessageInput } from "@/components/MessageInput";
+import { ForwardPicker } from "@/components/ForwardPicker";
 import type { ConversationSummary, Message, MessagePage } from "@/types";
 
 const TYPING_TIMEOUT_MS = 3000;
@@ -44,6 +45,7 @@ export default function ConversationPage() {
   const [error, setError] = useState<string | null>(null);
   const [editingMessage, setEditingMessage] = useState<Message | null>(null);
   const [highlightMessageId, setHighlightMessageId] = useState<number | null>(null);
+  const [forwardingMessage, setForwardingMessage] = useState<Message | null>(null);
   const [typingUserIds, setTypingUserIds] = useState<Set<number>>(new Set());
   const typingTimeoutsRef = useRef<Map<number, ReturnType<typeof setTimeout>>>(new Map());
   // FIFO queue of this tab's own not-yet-confirmed placeholder ids. chat.py
@@ -129,12 +131,27 @@ export default function ConversationPage() {
 
   const { sendMessage, sendFileMessage, sendTyping } = useChatSocket(conversationId, {
     onMessage: (message) => {
+      // ConnectionManager.send_to_user fans out to EVERY socket a user has
+      // open, regardless of which conversation each one represents (see
+      // MESSAGE_FORWARD_PLAN.md's "real constraint #1") — a message
+      // forwarded elsewhere, or sent in some other conversation while this
+      // tab also happens to be connected, must never leak into this view.
+      if (message.conversation_id !== conversationId) return;
+
       if (message.sender_id === currentUserId) {
-        // This is the self-echo of a message we sent — swap the oldest
-        // pending placeholder for the confirmed (real-id) message instead
-        // of appending a duplicate.
-        const placeholderId = pendingSentIdsRef.current.shift();
-        setMessages((prev) => prev.map((m) => (m.id === placeholderId ? message : m)));
+        if (pendingSentIdsRef.current.length > 0) {
+          // This is the self-echo of a message we sent through THIS tab —
+          // swap the oldest pending placeholder for the confirmed
+          // (real-id) message instead of appending a duplicate.
+          const placeholderId = pendingSentIdsRef.current.shift();
+          setMessages((prev) => prev.map((m) => (m.id === placeholderId ? message : m)));
+        } else {
+          // A message from ourselves with no placeholder to reconcile — e.g.
+          // a message we just forwarded landing directly in a conversation
+          // we already have open, rather than something typed into
+          // MessageInput here.
+          setMessages((prev) => [...prev, message]);
+        }
         return;
       }
       setMessages((prev) => [...prev, message]);
@@ -303,7 +320,16 @@ export default function ConversationPage() {
           onEdit={setEditingMessage}
           onDeleteForEveryone={handleDeleteForEveryone}
           onDeleteForMe={handleDeleteForMe}
+          onForward={setForwardingMessage}
           highlightMessageId={highlightMessageId}
+        />
+      )}
+
+      {forwardingMessage && (
+        <ForwardPicker
+          message={forwardingMessage}
+          sourceConversationId={conversationId}
+          onClose={() => setForwardingMessage(null)}
         />
       )}
 

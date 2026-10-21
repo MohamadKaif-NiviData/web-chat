@@ -19,6 +19,7 @@ from app.schemas.message import (
     MessageEditRequest,
     MessageSearchResult,
     MessageSearchPage,
+    ForwardMessageRequest,
 )
 from app.schemas.conversation import ConversationResponse, ConversationSummary, ParticipantSummary, GroupCreateRequest
 from app.schemas.attachment import AttachmentResponse
@@ -403,6 +404,17 @@ async def get_message_history(conversation_id: int, cursor: int | None = Query(N
         a.message_id: a for a in attachment_result.scalars().all()
     }
 
+    # Batch-fetch display names for any forwarded messages' original
+    # authors in this page — same shape as the read-receipt/attachment
+    # batching just above, not one query per message.
+    forwarded_from_ids = {m.forwarded_from_user_id for m in messages if m.forwarded_from_user_id}
+    forwarded_from_names: dict[int, str] = {}
+    if forwarded_from_ids:
+        forwarded_from_result = await db.execute(
+            select(User.id, User.display_name).where(User.id.in_(forwarded_from_ids))
+        )
+        forwarded_from_names = {uid: name for uid, name in forwarded_from_result.all()}
+
     def build_attachment(m: Message) -> AttachmentResponse | None:
         a = attachment_by_message.get(m.id)
         if a is None:
@@ -428,6 +440,10 @@ async def get_message_history(conversation_id: int, cursor: int | None = Query(N
             read_by=read_by_map.get(m.id, []),
             attachment=build_attachment(m),
             edited_at=m.edited_at,
+            forwarded_from_user_id=m.forwarded_from_user_id,
+            forwarded_from_display_name=forwarded_from_names.get(m.forwarded_from_user_id)
+            if m.forwarded_from_user_id
+            else None,
         )
         for m in messages
     ]
@@ -569,6 +585,100 @@ async def hide_message_for_me(
     await manager.send_to_user(current_user.id, {"type": "message_hidden", "message_id": message_id})
 
     return {"status": "hidden"}
+
+
+@router.post("/{conversation_id}/messages/{message_id}/forward", response_model=MessageResponse)
+async def forward_message(
+    conversation_id: int,
+    message_id: int,
+    payload: ForwardMessageRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Message).where(Message.id == message_id, Message.conversation_id == conversation_id)
+    )
+    source_message = result.scalar_one_or_none()
+    if not source_message:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    # Anyone who can currently SEE the message may forward it — unlike edit/
+    # delete-for-everyone, there's no ownership check here at all.
+    source_participant_result = await db.execute(
+        select(Participant).where(
+            Participant.conversation_id == conversation_id,
+            Participant.user_id == current_user.id,
+        )
+    )
+    if not source_participant_result.scalar_one_or_none():
+        raise HTTPException(status_code=403, detail="Not authorized to forward this message")
+
+    # "Can see it" also means it isn't something THEY hid "for me" — treated
+    # as 404, same as if it didn't exist for them, consistent with every
+    # other read path's hidden-message exclusion.
+    hidden_result = await db.execute(
+        select(HiddenMessage).where(
+            HiddenMessage.message_id == message_id,
+            HiddenMessage.user_id == current_user.id,
+        )
+    )
+    if hidden_result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    # Text-only in this version — never trust a client to simply not show
+    # the Forward button on an attachment message; the server re-checks.
+    attachment_result = await db.execute(select(Attachment).where(Attachment.message_id == message_id))
+    if attachment_result.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="Forwarding messages with attachments isn't supported")
+
+    target_participant_result = await db.execute(
+        select(Participant).where(
+            Participant.conversation_id == payload.target_conversation_id,
+            Participant.user_id == current_user.id,
+        )
+    )
+    if not target_participant_result.scalar_one_or_none():
+        raise HTTPException(status_code=403, detail="Not authorized to forward into this conversation")
+
+    # Forwarding a forward keeps the ORIGINAL author, not whoever forwarded
+    # it last — chain-proofs the attribution instead of pointing at an
+    # intermediate hop.
+    origin_user_id = source_message.forwarded_from_user_id or source_message.sender_id
+
+    new_message = Message(
+        conversation_id=payload.target_conversation_id,
+        sender_id=current_user.id,
+        content=source_message.content,
+        type="text",
+        forwarded_from_user_id=origin_user_id,
+    )
+    db.add(new_message)
+    await db.commit()
+    await db.refresh(new_message)
+
+    origin_name_result = await db.execute(select(User.display_name).where(User.id == origin_user_id))
+    origin_display_name = origin_name_result.scalar_one_or_none()
+
+    response = MessageResponse.model_validate(new_message)
+    response.forwarded_from_display_name = origin_display_name
+
+    # Full fanout including the forwarder's own other sessions, same as
+    # edit/delete — safe now that the frontend filters incoming messages by
+    # conversation_id (see MESSAGE_FORWARD_PLAN.md's "real constraint #1";
+    # without that filter this would leak into whatever conversation the
+    # forwarder currently has open).
+    other_result = await db.execute(
+        select(Participant.user_id).where(
+            Participant.conversation_id == payload.target_conversation_id,
+            Participant.user_id != current_user.id,
+        )
+    )
+    other_user_ids = [row[0] for row in other_result.all()]
+    broadcast_payload = response.model_dump(mode="json")
+    for uid in [*other_user_ids, current_user.id]:
+        await manager.send_to_user(uid, broadcast_payload)
+
+    return response
 
 
 # Why: the frontend's conversation page only knows the conversation_id from

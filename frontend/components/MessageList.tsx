@@ -15,6 +15,7 @@ interface MessageListProps {
   onEdit: (message: Message) => void;
   onDeleteForEveryone: (messageId: number) => void;
   onDeleteForMe: (messageId: number) => void;
+  onForward: (message: Message) => void;
   highlightMessageId?: number | null;
 }
 
@@ -30,6 +31,7 @@ export function MessageList({
   onEdit,
   onDeleteForEveryone,
   onDeleteForMe,
+  onForward,
   highlightMessageId,
 }: MessageListProps) {
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -98,6 +100,11 @@ export function MessageList({
                   {participantsById[message.sender_id] ?? "Unknown"}
                 </span>
               )}
+              {message.forwarded_from_display_name && (
+                <span className="mb-0.5 px-1 text-xs italic text-zinc-500">
+                  Forwarded from {message.forwarded_from_display_name}
+                </span>
+              )}
               <div
                 className={`max-w-xs rounded-2xl px-4 py-2 text-sm ${
                   isMine ? "bg-foreground text-background" : "bg-zinc-100 dark:bg-zinc-800"
@@ -137,6 +144,14 @@ export function MessageList({
                       Delete for everyone
                     </button>
                   </>
+                )}
+                {/* Text-only in this version — an attachment message never
+                    offers Forward, a stated limitation rather than a silent
+                    empty-content forward (see MESSAGE_FORWARD_PLAN.md). */}
+                {!attachment && (
+                  <button onClick={() => onForward(message)} className="underline hover:text-zinc-900 dark:hover:text-zinc-100">
+                    Forward
+                  </button>
                 )}
                 <button onClick={() => onDeleteForMe(message.id)} className="underline hover:text-zinc-900 dark:hover:text-zinc-100">
                   Delete for me
