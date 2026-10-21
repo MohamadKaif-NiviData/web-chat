@@ -14,3 +14,4 @@ class Message(Base):
     type: Mapped[str] = mapped_column(String, default="text")
     created_at : Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     edited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
+    forwarded_from_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, default=None)

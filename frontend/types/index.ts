@@ -22,6 +22,8 @@ export interface Message {
   read_by: number[];
   attachment?: Attachment | null;
   edited_at?: string | null;
+  forwarded_from_user_id?: number | null;
+  forwarded_from_display_name?: string | null;
 }
 
 export interface MessagePage {

@@ -13,6 +13,8 @@ class MessageResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     attachment: AttachmentResponse | None = None
     edited_at: datetime | None = None
+    forwarded_from_user_id: int | None = None
+    forwarded_from_display_name: str | None = None
 
 class MessagePage(BaseModel):
     messages: list[MessageResponse]
@@ -38,3 +40,6 @@ class MessageSearchResult(BaseModel):
 class MessageSearchPage(BaseModel):
     results: list[MessageSearchResult]
     next_cursor: int | None
+
+class ForwardMessageRequest(BaseModel):
+    target_conversation_id: int
