@@ -11,6 +11,7 @@ import type {
   MessageEditedEvent,
   MessageDeletedEvent,
   MessageHiddenEvent,
+  RemovedFromConversationEvent,
 } from "@/types";
 
 const TYPING_THROTTLE_MS = 2000;
@@ -22,6 +23,7 @@ interface ChatSocketHandlers {
   onMessageEdited?: (messageId: number, content: string, editedAt: string) => void;
   onMessageDeleted?: (messageId: number) => void;
   onMessageHidden?: (messageId: number) => void;
+  onRemovedFromConversation?: (conversationId: number) => void;
 }
 
 export function useChatSocket(conversationId: number | null, handlers: ChatSocketHandlers) {
@@ -51,7 +53,8 @@ export function useChatSocket(conversationId: number | null, handlers: ChatSocke
         | ReadEvent
         | MessageEditedEvent
         | MessageDeletedEvent
-        | MessageHiddenEvent;
+        | MessageHiddenEvent
+        | RemovedFromConversationEvent;
       if (data.type === "typing") {
         handlersRef.current.onTyping((data as TypingEvent).user_id);
       } else if (data.type === "read") {
@@ -64,6 +67,10 @@ export function useChatSocket(conversationId: number | null, handlers: ChatSocke
         handlersRef.current.onMessageDeleted?.((data as MessageDeletedEvent).message_id);
       } else if (data.type === "message_hidden") {
         handlersRef.current.onMessageHidden?.((data as MessageHiddenEvent).message_id);
+      } else if (data.type === "removed_from_conversation") {
+        handlersRef.current.onRemovedFromConversation?.(
+          (data as RemovedFromConversationEvent).conversation_id,
+        );
       } else {
         handlersRef.current.onMessage(data as Message);
       }

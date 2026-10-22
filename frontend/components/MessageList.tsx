@@ -75,6 +75,19 @@ export function MessageList({
       )}
       <div className="flex flex-col gap-2">
         {messages.map((message) => {
+          // System notices ("Bob left the group") aren't sent by/to anyone
+          // in the normal sense — render them as a centered, bubble-less
+          // line instead of forcing them through the mine-vs-theirs layout,
+          // and skip every per-message action (edit/delete/forward/seen)
+          // that assumes a real sender.
+          if (message.type === "system") {
+            return (
+              <p key={message.id} className="my-1 text-center text-xs italic text-zinc-500">
+                {message.content}
+              </p>
+            );
+          }
+
           const isMine = message.sender_id === currentUserId;
           // "Seen" only ever applies to your own messages, and only once
           // EVERY other participant has read it — otherParticipantIds is

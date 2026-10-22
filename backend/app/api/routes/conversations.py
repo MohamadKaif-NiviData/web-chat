@@ -78,7 +78,7 @@ async def create_group_conversation(payload: GroupCreateRequest, current_user: U
             detail=f"No user found for: {', '.join(sorted(missing_emails))}",
         )
 
-    conversation = Conversation(is_group=True, name=payload.name)
+    conversation = Conversation(is_group=True, name=payload.name, created_by_user_id=current_user.id)
     db.add(conversation)
     await db.commit()
     await db.refresh(conversation)
@@ -166,6 +166,7 @@ async def list_conversations(current_user: User = Depends(get_current_user), db:
                     is_online=await is_online(user.id),
                 ) for user in other_users],
                 last_message=MessageResponse.model_validate(last_message) if last_message else None,
+                created_by_user_id=conversation.created_by_user_id,
             )
         )
 
@@ -466,6 +467,9 @@ async def edit_message(
     if not message:
         raise HTTPException(status_code=404, detail="Message not found")
 
+    if message.type != "text":
+        raise HTTPException(status_code=400, detail="System messages cannot be edited")
+
     if message.sender_id != current_user.id:
         raise HTTPException(status_code=403, detail="Not authorized to edit this message")
 
@@ -511,6 +515,9 @@ async def delete_message_for_everyone(
     message = result.scalar_one_or_none()
     if not message:
         raise HTTPException(status_code=404, detail="Message not found")
+
+    if message.type != "text":
+        raise HTTPException(status_code=400, detail="System messages cannot be deleted")
 
     if message.sender_id != current_user.id:
         raise HTTPException(status_code=403, detail="Not authorized to delete this message")
@@ -748,7 +755,127 @@ async def get_conversation(conversation_id: int, current_user: User = Depends(ge
             is_online=await is_online(user.id),
         ) for user in other_users],
         last_message=MessageResponse.model_validate(last_message) if last_message else None,
+        created_by_user_id=conversation.created_by_user_id,
     )
+
+
+@router.post("/{conversation_id}/leave")
+async def leave_group(
+    conversation_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(Conversation).where(Conversation.id == conversation_id))
+    conversation = result.scalar_one_or_none()
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    if not conversation.is_group:
+        raise HTTPException(status_code=400, detail="Cannot leave a 1-to-1 conversation")
+
+    participant_result = await db.execute(
+        select(Participant).where(
+            Participant.conversation_id == conversation_id,
+            Participant.user_id == current_user.id,
+        )
+    )
+    participant = participant_result.scalar_one_or_none()
+    if not participant:
+        raise HTTPException(status_code=403, detail="Not a participant of this conversation")
+
+    await db.delete(participant)
+    await db.commit()
+
+    system_message = Message(
+        conversation_id=conversation_id,
+        sender_id=current_user.id,
+        content=f"{current_user.display_name} left the group",
+        type="system",
+    )
+    db.add(system_message)
+    await db.commit()
+    await db.refresh(system_message)
+
+    # The leaver's own row is already gone, so this naturally excludes them
+    # — no self-only event needed, their own REST response is enough for
+    # their own client to react (see GROUP_MEMBERSHIP_PLAN.md's constraint #3).
+    remaining_result = await db.execute(
+        select(Participant.user_id).where(Participant.conversation_id == conversation_id)
+    )
+    remaining_user_ids = [row[0] for row in remaining_result.all()]
+    broadcast_payload = MessageResponse.model_validate(system_message).model_dump(mode="json")
+    for uid in remaining_user_ids:
+        await manager.send_to_user(uid, broadcast_payload)
+
+    return {"status": "left"}
+
+
+@router.delete("/{conversation_id}/participants/{user_id}")
+async def remove_participant(
+    conversation_id: int,
+    user_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(Conversation).where(Conversation.id == conversation_id))
+    conversation = result.scalar_one_or_none()
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    if not conversation.is_group:
+        raise HTTPException(status_code=400, detail="Cannot remove participants from a 1-to-1 conversation")
+
+    if current_user.id != conversation.created_by_user_id:
+        raise HTTPException(status_code=403, detail="Only the group's creator can remove members")
+
+    if user_id == current_user.id:
+        raise HTTPException(status_code=400, detail="Use leave instead of removing yourself")
+
+    target_participant_result = await db.execute(
+        select(Participant).where(
+            Participant.conversation_id == conversation_id,
+            Participant.user_id == user_id,
+        )
+    )
+    target_participant = target_participant_result.scalar_one_or_none()
+    if not target_participant:
+        raise HTTPException(status_code=404, detail="That user is not a participant of this conversation")
+
+    target_user_result = await db.execute(select(User).where(User.id == user_id))
+    target_user = target_user_result.scalar_one()
+
+    await db.delete(target_participant)
+    await db.commit()
+
+    system_message = Message(
+        conversation_id=conversation_id,
+        sender_id=current_user.id,
+        content=f"{current_user.display_name} removed {target_user.display_name} from the group",
+        type="system",
+    )
+    db.add(system_message)
+    await db.commit()
+    await db.refresh(system_message)
+
+    other_result = await db.execute(
+        select(Participant.user_id).where(
+            Participant.conversation_id == conversation_id,
+            Participant.user_id != current_user.id,
+        )
+    )
+    other_user_ids = [row[0] for row in other_result.all()]
+    broadcast_payload = MessageResponse.model_validate(system_message).model_dump(mode="json")
+    for uid in [*other_user_ids, current_user.id]:
+        await manager.send_to_user(uid, broadcast_payload)
+
+    # A passive notification for the removed user specifically — unlike the
+    # leaver, they didn't initiate anything, so there's no synchronous REST
+    # response of their own to react to (see constraint #3).
+    await manager.send_to_user(
+        user_id, {"type": "removed_from_conversation", "conversation_id": conversation_id}
+    )
+
+    return {"status": "removed"}
 
 
 @router.post("/{conversation_id}/messages/read")

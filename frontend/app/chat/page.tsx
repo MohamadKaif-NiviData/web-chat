@@ -14,6 +14,7 @@ export default function ChatListPage() {
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [otherUserEmail, setOtherUserEmail] = useState("");
   const [starting, setStarting] = useState(false);
   const [showStartForm, setShowStartForm] = useState(false);
@@ -28,6 +29,12 @@ export default function ChatListPage() {
     if (!isAuthenticated()) {
       router.replace("/login");
       return;
+    }
+    // Read directly from the URL rather than useSearchParams — same reason
+    // as the conversation page's `around` param: this is a "use client"
+    // page with no Suspense boundary above it.
+    if (new URLSearchParams(window.location.search).get("notice") === "removed") {
+      setNotice("You were removed from that group.");
     }
     apiJson<ConversationSummary[]>("/conversations/")
       .then(setConversations)
@@ -245,6 +252,7 @@ export default function ChatListPage() {
 
       <MessageSearch />
 
+      {notice && <p className="px-4 py-2 text-sm text-zinc-500">{notice}</p>}
       {error && <p className="px-4 py-2 text-sm text-red-600">{error}</p>}
 
       {loading ? (
