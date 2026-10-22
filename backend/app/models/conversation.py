@@ -32,6 +32,7 @@ class Conversation(Base):
     created_at : Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     is_group : Mapped[bool] = mapped_column(default=False)
     name: Mapped[str] = mapped_column(String(255), nullable=True)
+    created_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, default=None)
 
 class Participant(Base):
     __tablename__ = "participants"

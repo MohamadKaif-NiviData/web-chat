@@ -44,6 +44,7 @@ export interface ConversationSummary {
   name: string;
   participants: ParticipantSummary[];
   last_message: Message | null;
+  created_by_user_id?: number | null;
 }
 
 export interface ConversationCreateResponse {
@@ -82,6 +83,11 @@ export type MessageDeletedEvent = {
 export type MessageHiddenEvent = {
   type: "message_hidden";
   message_id: number;
+};
+
+export type RemovedFromConversationEvent = {
+  type: "removed_from_conversation";
+  conversation_id: number;
 };
 
 export interface MessageSearchResult {

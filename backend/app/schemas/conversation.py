@@ -39,6 +39,7 @@ class ConversationSummary(BaseModel):
     is_group:bool
     name:str
     participants: list[ParticipantSummary]
+    created_by_user_id: int | None = None
 
 class GroupCreateRequest(BaseModel):
     name: str

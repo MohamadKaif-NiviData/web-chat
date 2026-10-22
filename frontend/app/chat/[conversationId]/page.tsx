@@ -9,6 +9,7 @@ import type { UploadedAttachment } from "@/lib/uploads";
 import { MessageList } from "@/components/MessageList";
 import { MessageInput } from "@/components/MessageInput";
 import { ForwardPicker } from "@/components/ForwardPicker";
+import { GroupInfoPanel } from "@/components/GroupInfoPanel";
 import type { ConversationSummary, Message, MessagePage } from "@/types";
 
 const TYPING_TIMEOUT_MS = 3000;
@@ -46,6 +47,7 @@ export default function ConversationPage() {
   const [editingMessage, setEditingMessage] = useState<Message | null>(null);
   const [highlightMessageId, setHighlightMessageId] = useState<number | null>(null);
   const [forwardingMessage, setForwardingMessage] = useState<Message | null>(null);
+  const [showGroupInfo, setShowGroupInfo] = useState(false);
   const [typingUserIds, setTypingUserIds] = useState<Set<number>>(new Set());
   const typingTimeoutsRef = useRef<Map<number, ReturnType<typeof setTimeout>>>(new Map());
   // FIFO queue of this tab's own not-yet-confirmed placeholder ids. chat.py
@@ -193,6 +195,14 @@ export default function ConversationPage() {
     onMessageHidden: (messageId) => {
       setMessages((prev) => prev.filter((m) => m.id !== messageId));
     },
+    // Unlike leaving (where our own REST call's success is the synchronous
+    // signal), being removed is something someone else did to us — there's
+    // no response of our own to react to, so this event is the only way our
+    // open tab finds out (see GROUP_MEMBERSHIP_PLAN.md's constraint #3).
+    onRemovedFromConversation: (removedConversationId) => {
+      if (removedConversationId !== conversationId) return;
+      router.push("/chat?notice=removed");
+    },
   });
 
   useEffect(() => {
@@ -292,6 +302,15 @@ export default function ConversationPage() {
     }
   }
 
+  // The removed participant's row is already gone server-side by the time
+  // this fires — just drop them from local state so the panel/header
+  // reflect it immediately instead of waiting on a refetch.
+  function handleParticipantRemoved(userId: number) {
+    setConversation((prev) =>
+      prev ? { ...prev, participants: prev.participants.filter((p) => p.id !== userId) } : prev,
+    );
+  }
+
   if (currentUserId === null) return null;
 
   return (
@@ -300,8 +319,26 @@ export default function ConversationPage() {
         <button onClick={() => router.push("/chat")} className="text-sm text-zinc-500 underline">
           ← Back
         </button>
-        {conversation && <h1 className="font-medium">{conversation.name}</h1>}
+        {conversation && (
+          <button
+            onClick={() => conversation.is_group && setShowGroupInfo(true)}
+            className="font-medium"
+            disabled={!conversation.is_group}
+          >
+            {conversation.name}
+          </button>
+        )}
       </div>
+
+      {showGroupInfo && conversation && (
+        <GroupInfoPanel
+          conversation={conversation}
+          currentUserId={currentUserId}
+          onClose={() => setShowGroupInfo(false)}
+          onParticipantRemoved={handleParticipantRemoved}
+          onLeft={() => router.push("/chat")}
+        />
+      )}
 
       {error && <p className="px-4 py-2 text-sm text-red-600">{error}</p>}
 

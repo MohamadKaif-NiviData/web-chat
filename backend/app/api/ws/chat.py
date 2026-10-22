@@ -82,6 +82,20 @@ async def chat_endpoint(
         while True:
             data = await websocket.receive_json()
 
+            # Authorization at connect() time only covers the start of this
+            # connection's lifetime — a user removed/left mid-connection
+            # must not be able to keep posting via a socket opened before
+            # that happened. Re-check on every message, not just once.
+            still_participant = await db.execute(
+                select(Participant).where(
+                    Participant.conversation_id == conversation_id,
+                    Participant.user_id == user_id,
+                )
+            )
+            if not still_participant.scalar_one_or_none():
+                await websocket.close(code=1008)
+                break
+
             other = await db.execute(
                 select(Participant.user_id).where(
                     Participant.conversation_id == conversation_id,
