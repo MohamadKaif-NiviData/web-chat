@@ -154,6 +154,21 @@ async def list_conversations(current_user: User = Depends(get_current_user), db:
         )
         last_message = last_message_result.scalar_one_or_none()
 
+        # A pin is shared, everyone-sees-it state, but each viewer's own
+        # hidden-for-me exclusion still wins for THEM specifically — same
+        # subquery already used for last_message just above.
+        pinned_message = None
+        if conversation.pinned_message_id is not None:
+            pinned_message_result = await db.execute(
+                select(Message).where(
+                    Message.id == conversation.pinned_message_id,
+                    Message.id.notin_(hidden_message_ids),
+                )
+            )
+            pinned_message_row = pinned_message_result.scalar_one_or_none()
+            if pinned_message_row:
+                pinned_message = MessageResponse.model_validate(pinned_message_row)
+
         summaries.append(
             ConversationSummary(
                 conversation_id=conversation_id,
@@ -167,6 +182,7 @@ async def list_conversations(current_user: User = Depends(get_current_user), db:
                 ) for user in other_users],
                 last_message=MessageResponse.model_validate(last_message) if last_message else None,
                 created_by_user_id=conversation.created_by_user_id,
+                pinned_message=pinned_message,
             )
         )
 
@@ -525,10 +541,19 @@ async def delete_message_for_everyone(
     if datetime.now(timezone.utc) - message.created_at > DELETE_WINDOW:
         raise HTTPException(status_code=403, detail="Delete window has expired")
 
-    # Delete order matters: both message_reads and attachments reference
-    # messages.id with no cascade configured — deleting the message first
-    # raises a real ForeignKeyViolation (hit once already during manual test
-    # cleanup after the push notifications work).
+    # Delete order matters: message_reads, attachments, AND a conversation's
+    # pinned_message_id all reference messages.id with no cascade configured
+    # — deleting the message first raises a real ForeignKeyViolation (the
+    # message_reads/attachments case already hit once during manual test
+    # cleanup after the push notifications work; pinned_message_id is the
+    # same class of bug, just with a new column — see PIN_MESSAGE_PLAN.md's
+    # "real constraint #1").
+    conversation_result = await db.execute(select(Conversation).where(Conversation.id == conversation_id))
+    conversation = conversation_result.scalar_one_or_none()
+    was_pinned = conversation is not None and conversation.pinned_message_id == message_id
+    if was_pinned:
+        conversation.pinned_message_id = None
+
     await db.execute(delete(HiddenMessage).where(HiddenMessage.message_id == message_id))
     await db.execute(delete(MessageRead).where(MessageRead.message_id == message_id))
 
@@ -550,6 +575,8 @@ async def delete_message_for_everyone(
     other_user_ids = [row[0] for row in other_result.all()]
     for uid in [*other_user_ids, current_user.id]:
         await manager.send_to_user(uid, {"type": "message_deleted", "message_id": message_id})
+        if was_pinned:
+            await manager.send_to_user(uid, {"type": "message_unpinned", "conversation_id": conversation_id})
 
     return {"status": "deleted"}
 
@@ -688,6 +715,103 @@ async def forward_message(
     return response
 
 
+@router.post("/{conversation_id}/messages/{message_id}/pin")
+async def pin_message(
+    conversation_id: int,
+    message_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    conversation_result = await db.execute(select(Conversation).where(Conversation.id == conversation_id))
+    conversation = conversation_result.scalar_one_or_none()
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    message_result = await db.execute(
+        select(Message).where(Message.id == message_id, Message.conversation_id == conversation_id)
+    )
+    message = message_result.scalar_one_or_none()
+    if not message:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    participant_result = await db.execute(
+        select(Participant).where(
+            Participant.conversation_id == conversation_id,
+            Participant.user_id == current_user.id,
+        )
+    )
+    if not participant_result.scalar_one_or_none():
+        raise HTTPException(status_code=403, detail="Not authorized to pin messages in this conversation")
+
+    # Can't pin what you can't see — same reasoning as forwarding's
+    # identical check.
+    hidden_result = await db.execute(
+        select(HiddenMessage).where(
+            HiddenMessage.message_id == message_id,
+            HiddenMessage.user_id == current_user.id,
+        )
+    )
+    if hidden_result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    if conversation.pinned_message_id == message_id:
+        return {"status": "pinned"}
+
+    conversation.pinned_message_id = message_id
+    await db.commit()
+
+    # Bare signal only — never the message content itself. Every client
+    # reacts by re-fetching GET /conversations/{id}, which is the one place
+    # hidden-for-me visibility is actually computed (see PIN_MESSAGE_PLAN.md's
+    # "real constraint #2"). Full fanout including the actor themselves.
+    participants_result = await db.execute(
+        select(Participant.user_id).where(Participant.conversation_id == conversation_id)
+    )
+    participant_ids = [row[0] for row in participants_result.all()]
+    for uid in participant_ids:
+        await manager.send_to_user(
+            uid, {"type": "message_pinned", "conversation_id": conversation_id, "message_id": message_id}
+        )
+
+    return {"status": "pinned"}
+
+
+@router.delete("/{conversation_id}/pin")
+async def unpin_message(
+    conversation_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    conversation_result = await db.execute(select(Conversation).where(Conversation.id == conversation_id))
+    conversation = conversation_result.scalar_one_or_none()
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    participant_result = await db.execute(
+        select(Participant).where(
+            Participant.conversation_id == conversation_id,
+            Participant.user_id == current_user.id,
+        )
+    )
+    if not participant_result.scalar_one_or_none():
+        raise HTTPException(status_code=403, detail="Not authorized to unpin messages in this conversation")
+
+    if conversation.pinned_message_id is None:
+        return {"status": "unpinned"}
+
+    conversation.pinned_message_id = None
+    await db.commit()
+
+    participants_result = await db.execute(
+        select(Participant.user_id).where(Participant.conversation_id == conversation_id)
+    )
+    participant_ids = [row[0] for row in participants_result.all()]
+    for uid in participant_ids:
+        await manager.send_to_user(uid, {"type": "message_unpinned", "conversation_id": conversation_id})
+
+    return {"status": "unpinned"}
+
+
 # Why: the frontend's conversation page only knows the conversation_id from
 # the URL — it has no cheap way to get THIS conversation's participant
 # names (for showing "Alice: hello" style sender labels in a group) or
@@ -744,6 +868,23 @@ async def get_conversation(conversation_id: int, current_user: User = Depends(ge
     )
     last_message = last_message_result.scalar_one_or_none()
 
+    # Same hidden-for-me exclusion list_conversations already applies to its
+    # own last_message — needed here specifically so a pinned message this
+    # user has personally hidden never surfaces for them (see
+    # PIN_MESSAGE_PLAN.md).
+    hidden_message_ids = select(HiddenMessage.message_id).where(HiddenMessage.user_id == current_user.id)
+    pinned_message = None
+    if conversation.pinned_message_id is not None:
+        pinned_message_result = await db.execute(
+            select(Message).where(
+                Message.id == conversation.pinned_message_id,
+                Message.id.notin_(hidden_message_ids),
+            )
+        )
+        pinned_message_row = pinned_message_result.scalar_one_or_none()
+        if pinned_message_row:
+            pinned_message = MessageResponse.model_validate(pinned_message_row)
+
     return ConversationSummary(
         conversation_id=conversation_id,
         is_group=conversation.is_group,
@@ -756,6 +897,7 @@ async def get_conversation(conversation_id: int, current_user: User = Depends(ge
         ) for user in other_users],
         last_message=MessageResponse.model_validate(last_message) if last_message else None,
         created_by_user_id=conversation.created_by_user_id,
+        pinned_message=pinned_message,
     )
 
 

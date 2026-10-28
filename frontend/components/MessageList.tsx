@@ -16,6 +16,9 @@ interface MessageListProps {
   onDeleteForEveryone: (messageId: number) => void;
   onDeleteForMe: (messageId: number) => void;
   onForward: (message: Message) => void;
+  onPin: (message: Message) => void;
+  onUnpin: () => void;
+  pinnedMessageId?: number | null;
   highlightMessageId?: number | null;
 }
 
@@ -32,6 +35,9 @@ export function MessageList({
   onDeleteForEveryone,
   onDeleteForMe,
   onForward,
+  onPin,
+  onUnpin,
+  pinnedMessageId,
   highlightMessageId,
 }: MessageListProps) {
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -164,6 +170,18 @@ export function MessageList({
                 {!attachment && (
                   <button onClick={() => onForward(message)} className="underline hover:text-zinc-900 dark:hover:text-zinc-100">
                     Forward
+                  </button>
+                )}
+                {/* Any participant can pin/unpin, in both 1-to-1s and groups
+                    — no ownership check, unlike Edit/Delete for everyone
+                    (see PIN_MESSAGE_PLAN.md). */}
+                {message.id === pinnedMessageId ? (
+                  <button onClick={onUnpin} className="underline hover:text-zinc-900 dark:hover:text-zinc-100">
+                    Unpin
+                  </button>
+                ) : (
+                  <button onClick={() => onPin(message)} className="underline hover:text-zinc-900 dark:hover:text-zinc-100">
+                    Pin
                   </button>
                 )}
                 <button onClick={() => onDeleteForMe(message.id)} className="underline hover:text-zinc-900 dark:hover:text-zinc-100">

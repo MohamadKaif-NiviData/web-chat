@@ -10,6 +10,7 @@ import { MessageList } from "@/components/MessageList";
 import { MessageInput } from "@/components/MessageInput";
 import { ForwardPicker } from "@/components/ForwardPicker";
 import { GroupInfoPanel } from "@/components/GroupInfoPanel";
+import { PinnedMessageBanner } from "@/components/PinnedMessageBanner";
 import type { ConversationSummary, Message, MessagePage } from "@/types";
 
 const TYPING_TIMEOUT_MS = 3000;
@@ -72,6 +73,19 @@ export default function ConversationPage() {
     () => conversation?.participants.map((p) => p.id) ?? [],
     [conversation],
   );
+
+  // `conversation.pinned_message` is a snapshot from the last time it was
+  // fetched (on mount, or after a pin/unpin event) — it does NOT update
+  // when that message is later edited, since editing only patches
+  // `messages` state (via onMessageEdited), not `conversation`. Prefer the
+  // live copy from `messages` whenever it's loaded (keeping the banner
+  // edit-aware, per PIN_MESSAGE_USER_STORIES.md Story 11), and fall back to
+  // the fetched snapshot only when the pinned message isn't in the
+  // currently loaded window.
+  const pinnedMessageForBanner = useMemo(() => {
+    if (!conversation?.pinned_message) return null;
+    return messages.find((m) => m.id === conversation.pinned_message!.id) ?? conversation.pinned_message;
+  }, [conversation, messages]);
 
   // Fire-and-forget: the UI already knows what it asked to mark, so there's
   // nothing useful to do with the response beyond ignoring failures.
@@ -203,6 +217,18 @@ export default function ConversationPage() {
       if (removedConversationId !== conversationId) return;
       router.push("/chat?notice=removed");
     },
+    // Deliberately never carries the message content itself — re-fetching
+    // is what makes the hidden-for-me exclusion apply correctly to THIS
+    // viewer specifically, rather than trusting whatever the broadcast
+    // happened to include (see PIN_MESSAGE_PLAN.md's "real constraint #2").
+    onMessagePinned: (eventConversationId) => {
+      if (eventConversationId !== conversationId) return;
+      apiJson<ConversationSummary>(`/conversations/${conversationId}`).then(setConversation).catch(() => {});
+    },
+    onMessageUnpinned: (eventConversationId) => {
+      if (eventConversationId !== conversationId) return;
+      apiJson<ConversationSummary>(`/conversations/${conversationId}`).then(setConversation).catch(() => {});
+    },
   });
 
   useEffect(() => {
@@ -311,6 +337,43 @@ export default function ConversationPage() {
     );
   }
 
+  // Reuses the exact same `around` windowed-fetch the backend already
+  // built for search result navigation (see MESSAGE_SEARCH_PLAN.md) — the
+  // only difference is this is a direct call instead of a fresh page
+  // mount, since we're already on this conversation when the pin banner
+  // is clicked.
+  async function handleJumpToMessage(messageId: number) {
+    try {
+      const page = await apiJson<MessagePage>(`/conversations/${conversationId}/messages?around=${messageId}`);
+      setMessages([...page.messages].reverse());
+      setNextCursor(page.next_cursor);
+      if (highlightTimeoutRef.current) clearTimeout(highlightTimeoutRef.current);
+      setHighlightMessageId(messageId);
+      highlightTimeoutRef.current = setTimeout(() => setHighlightMessageId(null), HIGHLIGHT_TIMEOUT_MS);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to jump to message");
+    }
+  }
+
+  // Local state is updated only from the WebSocket event (onMessagePinned/
+  // onMessageUnpinned above), not directly from this call's response —
+  // same "one code path" reconciliation pattern used everywhere else here.
+  async function handlePin(messageId: number) {
+    try {
+      await apiJson(`/conversations/${conversationId}/messages/${messageId}/pin`, { method: "POST" });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to pin message");
+    }
+  }
+
+  async function handleUnpin() {
+    try {
+      await apiJson(`/conversations/${conversationId}/pin`, { method: "DELETE" });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to unpin message");
+    }
+  }
+
   if (currentUserId === null) return null;
 
   return (
@@ -340,6 +403,14 @@ export default function ConversationPage() {
         />
       )}
 
+      {pinnedMessageForBanner && (
+        <PinnedMessageBanner
+          message={pinnedMessageForBanner}
+          onJump={() => handleJumpToMessage(pinnedMessageForBanner.id)}
+          onUnpin={handleUnpin}
+        />
+      )}
+
       {error && <p className="px-4 py-2 text-sm text-red-600">{error}</p>}
 
       {loading ? (
@@ -358,6 +429,9 @@ export default function ConversationPage() {
           onDeleteForEveryone={handleDeleteForEveryone}
           onDeleteForMe={handleDeleteForMe}
           onForward={setForwardingMessage}
+          onPin={(message) => handlePin(message.id)}
+          onUnpin={handleUnpin}
+          pinnedMessageId={conversation?.pinned_message?.id ?? null}
           highlightMessageId={highlightMessageId}
         />
       )}
