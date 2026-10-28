@@ -40,6 +40,7 @@ class ConversationSummary(BaseModel):
     name:str
     participants: list[ParticipantSummary]
     created_by_user_id: int | None = None
+    pinned_message: MessageResponse | None = None
 
 class GroupCreateRequest(BaseModel):
     name: str

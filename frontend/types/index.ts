@@ -45,6 +45,7 @@ export interface ConversationSummary {
   participants: ParticipantSummary[];
   last_message: Message | null;
   created_by_user_id?: number | null;
+  pinned_message?: Message | null;
 }
 
 export interface ConversationCreateResponse {
@@ -87,6 +88,17 @@ export type MessageHiddenEvent = {
 
 export type RemovedFromConversationEvent = {
   type: "removed_from_conversation";
+  conversation_id: number;
+};
+
+export type MessagePinnedEvent = {
+  type: "message_pinned";
+  conversation_id: number;
+  message_id: number;
+};
+
+export type MessageUnpinnedEvent = {
+  type: "message_unpinned";
   conversation_id: number;
 };
 

@@ -12,6 +12,8 @@ import type {
   MessageDeletedEvent,
   MessageHiddenEvent,
   RemovedFromConversationEvent,
+  MessagePinnedEvent,
+  MessageUnpinnedEvent,
 } from "@/types";
 
 const TYPING_THROTTLE_MS = 2000;
@@ -24,6 +26,8 @@ interface ChatSocketHandlers {
   onMessageDeleted?: (messageId: number) => void;
   onMessageHidden?: (messageId: number) => void;
   onRemovedFromConversation?: (conversationId: number) => void;
+  onMessagePinned?: (conversationId: number) => void;
+  onMessageUnpinned?: (conversationId: number) => void;
 }
 
 export function useChatSocket(conversationId: number | null, handlers: ChatSocketHandlers) {
@@ -54,7 +58,9 @@ export function useChatSocket(conversationId: number | null, handlers: ChatSocke
         | MessageEditedEvent
         | MessageDeletedEvent
         | MessageHiddenEvent
-        | RemovedFromConversationEvent;
+        | RemovedFromConversationEvent
+        | MessagePinnedEvent
+        | MessageUnpinnedEvent;
       if (data.type === "typing") {
         handlersRef.current.onTyping((data as TypingEvent).user_id);
       } else if (data.type === "read") {
@@ -71,6 +77,10 @@ export function useChatSocket(conversationId: number | null, handlers: ChatSocke
         handlersRef.current.onRemovedFromConversation?.(
           (data as RemovedFromConversationEvent).conversation_id,
         );
+      } else if (data.type === "message_pinned") {
+        handlersRef.current.onMessagePinned?.((data as MessagePinnedEvent).conversation_id);
+      } else if (data.type === "message_unpinned") {
+        handlersRef.current.onMessageUnpinned?.((data as MessageUnpinnedEvent).conversation_id);
       } else {
         handlersRef.current.onMessage(data as Message);
       }
