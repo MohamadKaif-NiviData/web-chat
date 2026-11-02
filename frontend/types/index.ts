@@ -102,6 +102,17 @@ export type MessageUnpinnedEvent = {
   conversation_id: number;
 };
 
+export type ConversationRenamedEvent = {
+  type: "conversation_renamed";
+  conversation_id: number;
+  name: string;
+};
+
+export type ParticipantsAddedEvent = {
+  type: "participants_added";
+  conversation_id: number;
+};
+
 export interface MessageSearchResult {
   message_id: number;
   conversation_id: number;

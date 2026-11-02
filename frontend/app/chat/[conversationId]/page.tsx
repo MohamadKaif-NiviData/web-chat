@@ -229,6 +229,19 @@ export default function ConversationPage() {
       if (eventConversationId !== conversationId) return;
       apiJson<ConversationSummary>(`/conversations/${conversationId}`).then(setConversation).catch(() => {});
     },
+    // A group's name has no per-viewer visibility rule (unlike a pinned
+    // message), so it's safe to apply directly from the event instead of
+    // forcing a refetch — see GROUP_ADMIN_PLAN.md's "real constraint #1".
+    onConversationRenamed: (eventConversationId, name) => {
+      if (eventConversationId !== conversationId) return;
+      setConversation((prev) => (prev ? { ...prev, name } : prev));
+    },
+    // Bare signal, same as onMessagePinned/onMessageUnpinned — re-fetch is
+    // what actually assembles the new participants list server-side.
+    onParticipantsAdded: (eventConversationId) => {
+      if (eventConversationId !== conversationId) return;
+      apiJson<ConversationSummary>(`/conversations/${conversationId}`).then(setConversation).catch(() => {});
+    },
   });
 
   useEffect(() => {
