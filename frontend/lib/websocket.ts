@@ -14,6 +14,8 @@ import type {
   RemovedFromConversationEvent,
   MessagePinnedEvent,
   MessageUnpinnedEvent,
+  ConversationRenamedEvent,
+  ParticipantsAddedEvent,
 } from "@/types";
 
 const TYPING_THROTTLE_MS = 2000;
@@ -28,6 +30,8 @@ interface ChatSocketHandlers {
   onRemovedFromConversation?: (conversationId: number) => void;
   onMessagePinned?: (conversationId: number) => void;
   onMessageUnpinned?: (conversationId: number) => void;
+  onConversationRenamed?: (conversationId: number, name: string) => void;
+  onParticipantsAdded?: (conversationId: number) => void;
 }
 
 export function useChatSocket(conversationId: number | null, handlers: ChatSocketHandlers) {
@@ -60,7 +64,9 @@ export function useChatSocket(conversationId: number | null, handlers: ChatSocke
         | MessageHiddenEvent
         | RemovedFromConversationEvent
         | MessagePinnedEvent
-        | MessageUnpinnedEvent;
+        | MessageUnpinnedEvent
+        | ConversationRenamedEvent
+        | ParticipantsAddedEvent;
       if (data.type === "typing") {
         handlersRef.current.onTyping((data as TypingEvent).user_id);
       } else if (data.type === "read") {
@@ -81,6 +87,11 @@ export function useChatSocket(conversationId: number | null, handlers: ChatSocke
         handlersRef.current.onMessagePinned?.((data as MessagePinnedEvent).conversation_id);
       } else if (data.type === "message_unpinned") {
         handlersRef.current.onMessageUnpinned?.((data as MessageUnpinnedEvent).conversation_id);
+      } else if (data.type === "conversation_renamed") {
+        const renamedEvent = data as ConversationRenamedEvent;
+        handlersRef.current.onConversationRenamed?.(renamedEvent.conversation_id, renamedEvent.name);
+      } else if (data.type === "participants_added") {
+        handlersRef.current.onParticipantsAdded?.((data as ParticipantsAddedEvent).conversation_id);
       } else {
         handlersRef.current.onMessage(data as Message);
       }

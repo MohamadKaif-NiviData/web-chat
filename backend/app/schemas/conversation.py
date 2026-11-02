@@ -44,4 +44,10 @@ class ConversationSummary(BaseModel):
 
 class GroupCreateRequest(BaseModel):
     name: str
-    member_emails: list[EmailStr]    
+    member_emails: list[EmailStr]
+
+class RenameGroupRequest(BaseModel):
+    name: str
+
+class AddParticipantsRequest(BaseModel):
+    member_emails: list[EmailStr]

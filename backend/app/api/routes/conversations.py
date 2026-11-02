@@ -21,7 +21,14 @@ from app.schemas.message import (
     MessageSearchPage,
     ForwardMessageRequest,
 )
-from app.schemas.conversation import ConversationResponse, ConversationSummary, ParticipantSummary, GroupCreateRequest
+from app.schemas.conversation import (
+    ConversationResponse,
+    ConversationSummary,
+    ParticipantSummary,
+    GroupCreateRequest,
+    RenameGroupRequest,
+    AddParticipantsRequest,
+)
 from app.schemas.attachment import AttachmentResponse
 from app.core.config import presigned_get_url, delete_object, settings
 from app.services.presence import is_online
@@ -1018,6 +1025,135 @@ async def remove_participant(
     )
 
     return {"status": "removed"}
+
+
+@router.patch("/{conversation_id}")
+async def rename_group(
+    conversation_id: int,
+    payload: RenameGroupRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(Conversation).where(Conversation.id == conversation_id))
+    conversation = result.scalar_one_or_none()
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    if not conversation.is_group:
+        raise HTTPException(status_code=400, detail="Cannot rename a 1-to-1 conversation")
+
+    # Same permission check remove_participant already uses — one admin
+    # concept, reused, not a second one that happens to currently agree
+    # (see GROUP_ADMIN_PLAN.md).
+    if current_user.id != conversation.created_by_user_id:
+        raise HTTPException(status_code=403, detail="Only the group's creator can rename this group")
+
+    new_name = payload.name.strip()
+    if not new_name:
+        raise HTTPException(status_code=400, detail="Group name cannot be empty")
+
+    conversation.name = new_name
+    await db.commit()
+
+    system_message = Message(
+        conversation_id=conversation_id,
+        sender_id=current_user.id,
+        content=f'{current_user.display_name} renamed the group to "{new_name}"',
+        type="system",
+    )
+    db.add(system_message)
+    await db.commit()
+    await db.refresh(system_message)
+
+    participants_result = await db.execute(
+        select(Participant.user_id).where(Participant.conversation_id == conversation_id)
+    )
+    participant_ids = [row[0] for row in participants_result.all()]
+    broadcast_payload = MessageResponse.model_validate(system_message).model_dump(mode="json")
+    for uid in participant_ids:
+        # Two different broadcasts for two different kinds of state: the
+        # system message is a permanent, visible history record; the bare
+        # conversation_renamed event is what actually patches the live
+        # header, which a chat message can't reach on its own (see
+        # GROUP_ADMIN_PLAN.md's "real constraint #1").
+        await manager.send_to_user(uid, broadcast_payload)
+        await manager.send_to_user(
+            uid, {"type": "conversation_renamed", "conversation_id": conversation_id, "name": new_name}
+        )
+
+    return {"status": "renamed", "name": new_name}
+
+
+@router.post("/{conversation_id}/participants")
+async def add_participants(
+    conversation_id: int,
+    payload: AddParticipantsRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(Conversation).where(Conversation.id == conversation_id))
+    conversation = result.scalar_one_or_none()
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    if not conversation.is_group:
+        raise HTTPException(status_code=400, detail="Cannot add participants to a 1-to-1 conversation")
+
+    if current_user.id != conversation.created_by_user_id:
+        raise HTTPException(status_code=403, detail="Only the group's creator can add members")
+
+    # Same all-or-nothing email resolution create_group_conversation
+    # already uses — don't add a partial set if one email doesn't resolve.
+    users_result = await db.execute(select(User).where(User.email.in_(payload.member_emails)))
+    users = users_result.scalars().all()
+
+    found_emails = {user.email for user in users}
+    missing_emails = set(payload.member_emails) - found_emails
+    if missing_emails:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No user found for: {', '.join(sorted(missing_emails))}",
+        )
+
+    # Never insert a duplicate Participant row for someone already in the
+    # group — participants has no unique constraint on (conversation_id,
+    # user_id), so nothing but this check stops it (see GROUP_ADMIN_PLAN.md's
+    # "real constraint #2").
+    existing_result = await db.execute(
+        select(Participant.user_id).where(Participant.conversation_id == conversation_id)
+    )
+    existing_user_ids = {row[0] for row in existing_result.all()}
+    new_users = [user for user in users if user.id not in existing_user_ids]
+
+    if not new_users:
+        return {"status": "added", "added": []}
+
+    db.add_all([Participant(conversation_id=conversation_id, user_id=user.id) for user in new_users])
+    await db.commit()
+
+    names = ", ".join(user.display_name for user in new_users)
+    system_message = Message(
+        conversation_id=conversation_id,
+        sender_id=current_user.id,
+        content=f"{current_user.display_name} added {names} to the group",
+        type="system",
+    )
+    db.add(system_message)
+    await db.commit()
+    await db.refresh(system_message)
+
+    # Fetch participants AFTER the insert, so the fanout naturally includes
+    # the people who were just added.
+    participants_result = await db.execute(
+        select(Participant.user_id).where(Participant.conversation_id == conversation_id)
+    )
+    participant_ids = [row[0] for row in participants_result.all()]
+    broadcast_payload = MessageResponse.model_validate(system_message).model_dump(mode="json")
+    for uid in participant_ids:
+        await manager.send_to_user(uid, broadcast_payload)
+        await manager.send_to_user(uid, {"type": "participants_added", "conversation_id": conversation_id})
+
+    return {"status": "added", "added": [user.id for user in new_users]}
 
 
 @router.post("/{conversation_id}/messages/read")
